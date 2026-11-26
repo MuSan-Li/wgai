@@ -10,6 +10,7 @@ import org.jeecg.modules.ros2.service.ROS2BridgeService;
 import org.jeecg.modules.ros2.service.RobotHardwareService;
 import org.jeecg.modules.ros2.service.WebSocketPushService;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.validation.annotation.Validated;
 import org.springframework.web.bind.annotation.*;
 
@@ -93,10 +94,12 @@ public class NavigationController {
         // ⭐ Bug 2 fix: 全局重定位收敛保护(仅时间窗口, 不卡协方差 —— 协方差是否收敛只作为
         // /localization-ready 的提示信息, 不在这里硬拦截, 避免协方差因传感器噪声/未收敛
         // 长期高于阈值时把所有导航目标永久堵死)
+        if (refiningLocalization) return Result.error("初始定位检查仍在进行，请等待检查结束");
+        if (initialPoseMismatchMessage != null) return Result.error(initialPoseMismatchMessage);
         long last = lastGlobalLocalizationTime.get();
         long elapsed = System.currentTimeMillis() - last;
         if (last > 0 && elapsed < MIN_CONVERGENCE_MS) {
-            long remaining = (MIN_CONVERGENCE_MS - elapsed) / 1000;
+            String remaining = String.format(java.util.Locale.ROOT, "%.1f", (MIN_CONVERGENCE_MS - elapsed) / 1000.0);
             log.warn("[导航目标] 全局重定位收敛保护期内, 拒绝目标点, 剩余{}s", remaining);
             return Result.error(
                     "全局重定位刚触发,AMCL 正在收敛(TF 不稳定)。" +
@@ -109,10 +112,6 @@ public class NavigationController {
                 goal.getX(), goal.getY(),
                 goal.getTheta() == null ? "自动(按方位角)" : Math.toDegrees(goal.getTheta()) + "°",
                 goal.getSideApproachM());
-        if (hardwareService.isEmergencyStopActive()) {
-            log.warn("[导航目标] 检测到 Java 侧急停锁, 设置新目标前自动解除, 恢复 cmd_vel -> PLC 转发");
-            hardwareService.clearEmergencyStopLock();
-        }
         // 起点预旋转 → Nav2 → 终点对位/失败侧移，全部在 ManeuverService 里异步编排
         try {
             Map<String, Object> r = maneuverService.startMission(goal.getX(), goal.getY(), goal.getTheta(),
@@ -125,7 +124,7 @@ public class NavigationController {
             Result<Object> res = Result.error(e.getMessage());
             res.setResult(e.data);
             return res;
-        } catch (IllegalArgumentException e) {
+        } catch (IllegalArgumentException | IllegalStateException e) {
             return Result.error(e.getMessage());
         }
     }
@@ -245,7 +244,8 @@ public class NavigationController {
      */
     @PostMapping("/global-localization")
     @ApiOperation("触发 AMCL 全局重定位")
-    public Result<Void> triggerGlobalLocalization() {
+    public synchronized Result<Void> triggerGlobalLocalization() {
+        if (refiningLocalization) return Result.error("初始定位检查仍在进行，请等待结束后再重定位");
         try {
             String cmd = "source " + ROS_BASH + " && source " + SETUP_BASH
                     + " && ros2 service call /reinitialize_global_localization"
@@ -271,6 +271,8 @@ public class NavigationController {
             bridgeService.setNavMode(true);
 
             // ⭐ Bug 1 fix (a): 记录触发时间,setGoal 据此拒绝过早的导航目标
+            lastRefinementConverged = true;
+            initialPoseMismatchMessage = null;
             lastGlobalLocalizationTime.set(System.currentTimeMillis());
 
             // ⭐ Bug 1 fix (b): 推送 WebSocket 通知,前端可以显示"收敛中"状态
@@ -303,7 +305,7 @@ public class NavigationController {
      */
     @PostMapping("/initial-pose")
     @ApiOperation("手动设置 AMCL 初始位姿")
-    public Result<Void> setInitialPose(@RequestBody Map<String, Double> body) {
+    public synchronized Result<Void> setInitialPose(@RequestBody Map<String, Double> body) {
         double x     = body.getOrDefault("x",     0.0);
         double y     = body.getOrDefault("y",     0.0);
         double theta = body.getOrDefault("theta", 0.0);
@@ -312,6 +314,12 @@ public class NavigationController {
         double xyStd     = Math.max(0.1, Math.min(5.0, body.getOrDefault("xyStd", 0.5)));
         double yawStdDeg = Math.max(3.0, Math.min(180.0, body.getOrDefault("yawStdDeg", 15.0)));
 
+        if (!Double.isFinite(x) || !Double.isFinite(y) || !Double.isFinite(theta)
+                || !Double.isFinite(xyStd) || !Double.isFinite(yawStdDeg))
+            return Result.error("初始位姿参数必须是有限数值");
+        if (refiningLocalization) return Result.error("初始定位检查仍在进行，请勿重复设置");
+        if (maneuverService != null && maneuverService.isRunning()) return Result.error("请先取消当前导航任务，再校准初始位姿");
+        pushService.clearNavigationSnapshot();
         bridgeService.setNavMode(true);
         navigationService.sendInitialPose(x, y, theta, xyStd, Math.toRadians(yawStdDeg));
         refineLocalization(x, y, theta, xyStd, yawStdDeg);
@@ -331,30 +339,66 @@ public class NavigationController {
         return t;
     });
     private final AtomicLong refineSeq = new AtomicLong();
+    private volatile boolean refiningLocalization;
+    // Advisory result of the last bounded initial refinement, never a navigation latch.
+    private volatile boolean lastRefinementConverged = true;
+    private volatile String initialPoseMismatchMessage;
+    @Value("${ros.navigation.initial-refine-max-rounds:12}")
+    private int initialRefineMaxRounds = 12;
+    @Value("${ros.navigation.initial-refine-interval-ms:750}")
+    private long initialRefineIntervalMs = 750;
+    @Value("${ros.navigation.initial-refine-stable-m:0.05}")
+    private double initialRefineStableM = 0.05;
+    @Value("${ros.navigation.initial-refine-stable-deg:1.0}")
+    private double initialRefineStableDeg = 1.0;
 
     /**
      * 设完初始位姿后，车不动也让 AMCL 用当前这帧激光反复匹配收敛。
      * AMCL 默认要车走过 update_min_d(0.25m)/转过 update_min_a 才更新滤波器，车静止时粒子一直停在人点的那个
      * (点不准的)位置 → 开出去才发现地图和实际偏很大。/request_nomotion_update 逼它不动也更新一次，
-     * 连续催几十次，粒子就收拢到激光和地图对得最好的位置。
+     * 最多12次、间隔750ms，有连续新位姿且稳定时提前结束，禁止与导航同时运行。
      */
     private void refineLocalization(double setX, double setY, double setTheta, double xyStd, double yawStdDeg) {
         final long id = refineSeq.incrementAndGet();
-        // 范围越大需要的迭代越多
-        final int rounds = xyStd > 1.5 || yawStdDeg > 60 ? 60 : 25;
+        // Bound repeated use of stationary observations; broad priors require better initial placement.
+        final int rounds = Math.max(3, Math.min(30, initialRefineMaxRounds));
+        refiningLocalization = true;
+        lastRefinementConverged = false;
+        initialPoseMismatchMessage = null;
+        final long initialSequence = bridgeService.getAmclSample().sequence;
         refineExecutor.submit(() -> {
             try {
                 Thread.sleep(500);   // 等 AMCL 先按 /initialpose 撒完粒子
+                ROS2BridgeService.AmclSample previous = null;
+                long observed = initialSequence;
+                int stable = 0, fresh = 0, attempts = 0;
                 for (int i = 0; i < rounds && refineSeq.get() == id; i++) {
+                    attempts++;
                     bridgeService.callService("/request_nomotion_update", "std_srvs/srv/Empty",
                             new com.google.gson.JsonObject(), 1000);
-                    Thread.sleep(250);
+                    Thread.sleep(Math.max(500, initialRefineIntervalMs));
+                    ROS2BridgeService.AmclSample sample = bridgeService.getAmclSample();
+                    if (sample.sequence <= observed || sample.pose == null) continue;
+                    observed = sample.sequence; fresh++;
+                    previous=bridgeService.refreshAmclSample(previous);
+                    if (previous != null && previous.odomReference != null && sample.odomReference != null) {
+                        double[] predicted = org.jeecg.modules.ros2.service.NavigationGeometry.predict(
+                                previous.pose, previous.odomReference, sample.odomReference);
+                        double distance = Math.hypot(sample.pose[0]-predicted[0], sample.pose[1]-predicted[1]);
+                        double angle = Math.abs(org.jeecg.modules.ros2.service.NavigationGeometry.wrap(sample.pose[2]-predicted[2]));
+                        stable = distance <= initialRefineStableM && angle <= Math.toRadians(initialRefineStableDeg) ? stable+1 : 0;
+                    }
+                    previous = sample;
+                    double driftNow = Math.hypot(sample.pose[0]-setX, sample.pose[1]-setY);
+                    double yawNow = Math.abs(Math.toDegrees(org.jeecg.modules.ros2.service.NavigationGeometry.wrap(sample.pose[2]-setTheta)));
+                    if (driftNow > Math.max(1.0, xyStd*2) || yawNow > Math.max(20, yawStdDeg*1.5)) break;
+                    if (stable >= 2 && bridgeService.isAmclConverged(CONVERGENCE_COV_THRESHOLD)) break;
                 }
                 if (refineSeq.get() != id) return;   // 又设了一次初始位姿，这轮作废
                 double cxx = bridgeService.getLastAmclCovXX(), cyy = bridgeService.getLastAmclCovYY();
                 double[] p = bridgeService.getLastAmclPose();
-                boolean ok = bridgeService.isAmclConverged(CONVERGENCE_COV_THRESHOLD);
-                log.info("[定位修正] 原地匹配 {} 次完成: 位姿={} 协方差 xx={} yy={} {}", rounds,
+                boolean ok = fresh >= 3 && stable >= 2 && bridgeService.isAmclConverged(CONVERGENCE_COV_THRESHOLD);
+                log.info("[定位修正] 原地匹配 {} 次完成: 位姿={} 协方差 xx={} yy={} {}", attempts,
                         p == null ? "无" : String.format("(%.2f, %.2f, %.0f°)", p[0], p[1], Math.toDegrees(p[2])),
                         String.format("%.3f", cxx), String.format("%.3f", cyy), ok ? "已收敛" : "未收敛");
                 // 收敛到哪了？跑得比给的不确定范围还远，多半是**匹配错了地方**(走廊/料堆这种局部长得都差不多)。
@@ -370,8 +414,22 @@ public class NavigationController {
                     suspicious = drift > Math.max(1.0, xyStd * 2) || yawDriftDeg > Math.max(20.0, yawStdDeg * 1.5);
                 }
                 java.util.Map<String, Object> d = new java.util.LinkedHashMap<>();
+                lastRefinementConverged = ok && !suspicious;
+                initialPoseMismatchMessage = suspicious
+                        ? String.format("初始定位疑似匹配错位置：相对设定位姿偏离%.2fm、朝向差%.1f°；请核对并重新设置初始位姿", drift, yawDriftDeg)
+                        : null;
                 d.put("status", "refined");
                 d.put("converged", ok && !suspicious);
+                String reason = suspicious ? "suspicious_pose" : fresh < 3 ? "insufficient_updates"
+                        : stable < 2 ? "unstable_updates" : !bridgeService.isAmclConverged(CONVERGENCE_COV_THRESHOLD)
+                        ? "covariance_high" : "converged";
+                d.put("reason", reason);
+                d.put("requiresGoalCheck", true);
+                log.info("[定位修正结果] reason={} fresh={} stable={} covXX={} covYY={}",
+                        reason, fresh, stable, cxx, cyy);
+                d.put("attempts", attempts);
+                d.put("freshUpdates", fresh);
+                d.put("stableCorrections", stable);
                 d.put("covXX", cxx);
                 d.put("covYY", cyy);
                 d.put("driftM", drift);
@@ -385,27 +443,32 @@ public class NavigationController {
                                 + "请重新设置初始点位，位置误差选「±0.5m 较准」、朝向选「±15° 较准」；"
                                 + "若仍这样，多半是这一片环境长得太像，遥控车走 2~3m 再设一次", drift, yawDriftDeg)
                         : ok ? "定位已收敛，可以发导航目标"
-                        : "定位还没收敛(不确定范围仍偏大)：让车慢速直行 1~2m 帮助收敛，或把初始点位点得更准些再设一次");
+                        : String.format("初始收敛未确认：新更新%d次、连续稳定%d次，covXX=%.3f、covYY=%.3f；发送导航目标时会重新检查最新定位", fresh, stable, cxx, cyy));
                 pushService.pushToAll("localization_status", d);
             } catch (Exception e) {
                 log.warn("[定位修正] 失败: {}", e.getMessage());
+                java.util.Map<String,Object> failure = new java.util.LinkedHashMap<>();
+                failure.put("status", "refined"); failure.put("converged", false);
+                failure.put("reason", "refinement_error"); failure.put("requiresGoalCheck", true);
+                failure.put("message", "初始收敛请求失败；发送导航目标时会重新检查最新定位: " + e.getMessage());
+                pushService.pushToAll("localization_status", failure);
             }
+            finally { if (refineSeq.get() == id) refiningLocalization = false; }
         });
     }
 
     // ===================== 收敛状态查询(前端轮询用) =====================
 
     /**
-     * 判断是否真正可以发送导航目标: 已过最短等待时间窗口 且 AMCL 协方差已收敛。
-     * 两者都满足才算 ready, 单纯等够时间但协方差还很高(机器人没动/没转)不算。
+     * Whether a goal may enter its mandatory fresh-pose preflight.
+     * Initial refinement and covariance are advisory after the bounded waiting window.
      */
-    private boolean isConverged() {
+    private boolean canCheckNavigation() {
+        if (refiningLocalization || initialPoseMismatchMessage != null) return false;
         long last = lastGlobalLocalizationTime.get();
         if (last == 0) return true; // 从未触发过全局重定位/初始位姿, 不受此保护约束
         long elapsed = System.currentTimeMillis() - last;
-        boolean timeOk = elapsed >= MIN_CONVERGENCE_MS;
-        boolean covOk  = bridgeService.isAmclConverged(CONVERGENCE_COV_THRESHOLD);
-        return timeOk && covOk;
+        return elapsed >= MIN_CONVERGENCE_MS;
     }
 
     /**
@@ -414,20 +477,47 @@ public class NavigationController {
      * 用法: 前端在全局重定位后每秒轮询此接口,
      * 当 ready=true 时再显示"发送导航目标"按钮。
      *
-     * ready 需同时满足: ① 已过最短等待时间窗口(TF/costmap 稳定) ② AMCL 位姿协方差
-     * (covariance[0]/[7], 即x/y方差) 低于阈值(现场值 0.05m²), 不再只看计时器。
-     * 协方差需要机器人在等待期间实际移动/旋转才会下降, 静止不动不会收敛。
+     * ready means waiting has ended, not permission to move or proof of convergence.
+     * Every goal still checks fresh AMCL, matching odometry, jumps and static geometry.
      */
+    @Autowired
+    private MapController mapController;
+
+    @GetMapping("/runtime-state")
+    @ApiOperation("只读恢复导航页面的当前地图、位姿和任务状态")
+    public Result<Map<String, Object>> runtimeState() {
+        Map<String, Object> state = pushService.navigationSnapshot();
+        state.put("mapName", mapController.navigationMapName());
+        state.put("rosConnected", bridgeService.isConnected());
+        state.put("localizationTiming",bridgeService.localizationTiming(null));
+        ROS2BridgeService.AmclSample sample = bridgeService.getAmclSample();
+        if (sample != null && sample.pose != null) {
+            double[] estimated = bridgeService.getEstimatedMapPose();
+            double[] pose = estimated != null ? estimated : sample.pose;
+            Map<String, Object> p = new java.util.LinkedHashMap<>();
+            p.put("x", pose[0]); p.put("y", pose[1]); p.put("theta", pose[2]);
+            p.put("source", estimated != null ? "AMCL+里程计" : "AMCL缓存");
+            p.put("receivedAtMs", sample.receivedAtMs);
+            p.put("ageMs", Math.max(0, System.currentTimeMillis() - sample.receivedAtMs));
+            state.put("pose", p);
+        }
+        state.put("localization", isLocalizationReady().getResult());
+        return Result.OK(state);
+    }
+
     @GetMapping("/localization-ready")
     @ApiOperation("查询 AMCL 收敛等待是否完成")
     public Result<Map<String, Object>> isLocalizationReady() {
         long now     = System.currentTimeMillis();
         long last    = lastGlobalLocalizationTime.get();
         long elapsed = now - last;
-        boolean ready = isConverged();
+        boolean ready = canCheckNavigation();
 
         Map<String, Object> result = new java.util.LinkedHashMap<>();
         result.put("ready",       ready);
+        result.put("converged", lastRefinementConverged && bridgeService.isAmclConverged(CONVERGENCE_COV_THRESHOLD));
+        result.put("refining", refiningLocalization);
+        result.put("requiresGoalCheck", true);
         result.put("elapsed",     elapsed);
         result.put("waitMs",      MIN_CONVERGENCE_MS);
         result.put("remainingMs", ready ? 0 : Math.max(0, MIN_CONVERGENCE_MS - elapsed));
@@ -435,9 +525,10 @@ public class NavigationController {
         result.put("covYY",       bridgeService.getLastAmclCovYY());
         result.put("covThreshold", CONVERGENCE_COV_THRESHOLD);
         result.put("message",     ready
-                ? "可以发送导航目标"
-                : "AMCL 收敛等待中(需遥控机器人慢速移动/旋转帮助收敛), covXX=" + bridgeService.getLastAmclCovXX()
-                        + " covYY=" + bridgeService.getLastAmclCovYY());
+                ? "等待结束；发送导航目标时会重新检查最新定位及里程计"
+                : initialPoseMismatchMessage != null ? initialPoseMismatchMessage
+                : refiningLocalization ? "初始定位检查仍在进行，请等待检查结束"
+                : "定位设置后的等待期尚未结束");
         return Result.OK(result);
     }
 

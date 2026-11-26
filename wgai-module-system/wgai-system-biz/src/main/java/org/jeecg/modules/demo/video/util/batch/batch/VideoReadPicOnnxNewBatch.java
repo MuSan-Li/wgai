@@ -34,7 +34,7 @@ public class VideoReadPicOnnxNewBatch implements Runnable {
     private final RedisTemplate redisTemplate;
     private final String streamId;
     private VideoFrameGate frameGate;
-    private final BatchInferenceScheduler scheduler;
+    private volatile SubscriptionBatchProcessor processor;
 
     private static final long TARGET_FRAME_INTERVAL = 1000; // 1秒一帧
     private volatile long lastFrameTime = 0;
@@ -55,7 +55,6 @@ public class VideoReadPicOnnxNewBatch implements Runnable {
         this.tabAiSubscriptionNew = tabAiSubscriptionNew;
         this.redisTemplate = redisTemplate;
         this.streamId = tabAiSubscriptionNew.getId();
-        this.scheduler = scheduler;
     }
 
     @Override
@@ -63,6 +62,7 @@ public class VideoReadPicOnnxNewBatch implements Runnable {
         FFmpegFrameGrabber grabber = null;
 
         try {
+            processor = new SubscriptionBatchProcessor(tabAiSubscriptionNew, redisTemplate);
             grabber = createOptimizedGrabber();
             List<NetPush> netPushList = tabAiSubscriptionNew.getNetPushList();
 
@@ -137,12 +137,7 @@ public class VideoReadPicOnnxNewBatch implements Runnable {
                     }
 
                     // ========== 核心:提交到批量调度器 ==========
-                    CompletableFuture<Boolean> future = scheduler.submitFullInference(
-                            streamId,
-                            matInfo,      // Mat会在调度器中释放
-                            netPushList,
-                            tabAiSubscriptionNew
-                    );
+                    CompletableFuture<Boolean> future = processor.submit(matInfo);
 
                     // 异步处理结果(不阻塞主线程)
                     future.whenComplete((success, ex) -> {
@@ -150,6 +145,7 @@ public class VideoReadPicOnnxNewBatch implements Runnable {
                             log.error("[推理异常] 摄像头:{}", streamId, ex);
                         } else if (success) {
                             processedFrames.incrementAndGet();
+                org.jeecg.modules.demo.video.util.SubscriptionHeartbeatState.completed(tabAiSubscriptionNew);
                         }
                     });
 
@@ -257,6 +253,8 @@ public class VideoReadPicOnnxNewBatch implements Runnable {
         log.info("[开始强制清理] 流: {}", tabAiSubscriptionNew.getName());
         forceShutdown = true;
 
+        if (processor != null) processor.close();
+
         if (grabber != null) {
             try { grabber.stop(); } catch (Exception ignored) {}
             try { grabber.release(); } catch (Exception ignored) {}
@@ -285,5 +283,6 @@ public class VideoReadPicOnnxNewBatch implements Runnable {
     public void forceStop() {
         log.info("[外部请求强制停止] 流: {}", tabAiSubscriptionNew.getName());
         forceShutdown = true;
+        if (processor != null) processor.requestStop();
     }
 }

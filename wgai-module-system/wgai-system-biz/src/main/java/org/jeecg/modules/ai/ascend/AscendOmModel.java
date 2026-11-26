@@ -86,6 +86,8 @@ public class AscendOmModel implements AutoCloseable {
         return replicas.get(0).numOutputs();
     }
 
+    public long[] inputShape() { return replicas.get(0).inputShape(); }
+
     public int replicaCount() {
         return replicas.size();
     }

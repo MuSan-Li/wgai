@@ -92,6 +92,7 @@ public class BatchOnnxInference {
                     results.stream().mapToInt(r -> r.getInfoList() == null ? 0 : r.getInfoList().size()).average().orElse(0));
 
         } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[前置批量推理失败]", e);
             // 降级:单个推理
             for (int i = 0; i < batchSize; i++) {
@@ -146,6 +147,7 @@ public class BatchOnnxInference {
             log.info("[后置批量推理完成] 批次大小:{}, 成功:{}", batchSize, successCount);
 
         } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[后置批量推理失败]", e);
             for (int i = 0; i < batchSize; i++) {
                 results.add(false);
@@ -212,10 +214,21 @@ public class BatchOnnxInference {
         long[] shape = new long[]{batchSize, 3, 640, 640};
         List<DetectionResult> results = new ArrayList<>(batchSize);
 
-        // 昇腾 NPU 分支: model_jm_type=2 且 .om 存在时走 NPU, 否则继续往下走 ONNX
+        // 订阅 modelJmType=100 走 OM；已选择 OM 时失败直接报错。
         AscendOmRunner.BatchOutput npuOut = tryNpuInfer(netPush, batchInputData, batchSize);
         if (npuOut != null) {
             return parseBatchOutput(npuOut.rawOutput, npuOut.tensorShape, batchSize, numClasses);
+        }
+
+        int fixedBatch = fixedOnnxBatch(session);
+        if (fixedBatch > 0 && fixedBatch != batchSize) {
+            int frameSize = batchInputData.length / batchSize;
+            for (int offset = 0; offset < batchSize; offset += fixedBatch) {
+                int valid = Math.min(fixedBatch, batchSize - offset);
+                float[] part = org.jeecg.modules.demo.video.util.TensorBatch.slice(batchInputData, frameSize, offset, valid, fixedBatch);
+                results.addAll(runBatchOnnxInference(netPush, session, env, part, fixedBatch, numClasses).subList(0, valid));
+            }
+            return results;
         }
 
         // 创建输入tensor
@@ -231,6 +244,7 @@ public class BatchOnnxInference {
 
             // 执行推理
             try (OrtSession.Result onnxResults = session.run(inputs)) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
                 for (Map.Entry<String, OnnxValue> entry : onnxResults) {
                     if (!(entry.getValue() instanceof OnnxTensor)) continue;
 
@@ -272,11 +286,24 @@ public class BatchOnnxInference {
         AscendOmModel omModel = AscendOmPool.preload(model.getAiWeights());
 
         AscendOmRunner.BatchOutput out = AscendOmRunner.runBatch(omModel, batchInputData, batchSize);
+        org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
         if (out == null) {
             throw new IllegalStateException(
                     "om 推理失败且无 ONNX 可回退: " + omModel.getOmPath());
         }
         return out;
+    }
+
+    private static int fixedOnnxBatch(OrtSession session) throws OrtException {
+        NodeInfo node = session.getInputInfo().values().iterator().next();
+        if (!(node.getInfo() instanceof TensorInfo)) throw new IllegalArgumentException("模型输入必须为张量");
+        long[] dims = ((TensorInfo) node.getInfo()).getShape();
+        if (dims.length != 4 || (dims[1] > 0 && dims[1] != 3)
+                || (dims[2] > 0 && dims[2] != 640) || (dims[3] > 0 && dims[3] != 640)) {
+            throw new IllegalArgumentException("当前批量预处理需要 NCHW [N,3,640,640]，实际=" + Arrays.toString(dims));
+        }
+        if (dims[0] > 32) throw new IllegalArgumentException("当前支持的固定batch上限为32");
+        return dims[0] > 0 ? (int) dims[0] : 0;
     }
 
     // ==================== 核心:解析批量输出 ====================
@@ -462,6 +489,7 @@ public class BatchOnnxInference {
             }
 
         } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[前置后处理失败]", e);
         }
 
@@ -572,6 +600,7 @@ public class BatchOnnxInference {
             return true;
 
         } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[后置后处理失败]", e);
             return false;
         }
@@ -618,6 +647,7 @@ public class BatchOnnxInference {
             grabber.release();
             log.info("录制完成保存为{}", path);
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             ex.printStackTrace();
             log.error("[出错了检查一下]");
             return "";
@@ -678,6 +708,7 @@ public class BatchOnnxInference {
                 List<Mat> result = new ArrayList<>();
                 List<String> outBlobNames = net.getUnconnectedOutLayersNames();
                 net.forward(result, outBlobNames);
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
 
                 // 处理检测结果
                 float confThreshold = 0.42f;
@@ -788,6 +819,7 @@ public class BatchOnnxInference {
 //            tt.join();
             return saveMp4Path + "/avi.mp4";
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             ex.printStackTrace();
             log.error("录制失败");
             return "";
@@ -878,6 +910,7 @@ public class BatchOnnxInference {
 
 
             } catch (Exception exception) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(exception);
                 log.error("[报警处理失败] taskId={}", pushInfo.getId(), exception);
             }
         });
@@ -972,8 +1005,8 @@ public class BatchOnnxInference {
             dir.mkdirs();
         }
 
-        String fileName = savePath + System.currentTimeMillis() + ".jpg";
-        Imgcodecs.imwrite(fileName, image);
+        String fileName = new File(dir, System.currentTimeMillis() + "_" + UUID.randomUUID() + ".jpg").getPath();
+        if (!Imgcodecs.imwrite(fileName, image)) throw new IllegalStateException("告警图片保存失败: " + fileName);
 
         return fileName;
     }
@@ -1077,6 +1110,7 @@ public class BatchOnnxInference {
             log.info("[姿态批量推理完成] 批次大小:{}, 成功:{}", batchSize, successCount);
 
         } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[姿态批量推理失败]", e);
             for (int i = 0; i < batchSize; i++) {
                 results.add(false);
@@ -1105,6 +1139,17 @@ public class BatchOnnxInference {
             return parseBatchPoseOutput(npuOut.rawOutput, npuOut.tensorShape, batchSize);
         }
 
+        int fixedBatch = fixedOnnxBatch(session);
+        if (fixedBatch > 0 && fixedBatch != batchSize) {
+            int frameSize = batchInputData.length / batchSize;
+            for (int offset = 0; offset < batchSize; offset += fixedBatch) {
+                int valid = Math.min(fixedBatch, batchSize - offset);
+                float[] part = org.jeecg.modules.demo.video.util.TensorBatch.slice(batchInputData, frameSize, offset, valid, fixedBatch);
+                results.addAll(runBatchPoseOnnxInference(netPush, session, env, part, fixedBatch).subList(0, valid));
+            }
+            return results;
+        }
+
         FloatBuffer buffer = FloatBuffer.allocate(batchInputData.length);
         buffer.put(batchInputData);
         buffer.flip();
@@ -1116,6 +1161,7 @@ public class BatchOnnxInference {
             );
 
             try (OrtSession.Result onnxResults = session.run(inputs)) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
                 for (Map.Entry<String, OnnxValue> entry : onnxResults) {
                     if (!(entry.getValue() instanceof OnnxTensor)) continue;
 
@@ -1404,6 +1450,7 @@ public class BatchOnnxInference {
             return true;
 
         } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[姿态后处理失败]", e);
             return false;
         }

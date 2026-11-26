@@ -45,8 +45,9 @@ import lombok.extern.slf4j.Slf4j;
 @ServerEndpoint("/websocket/{userId}")
 public class WebSocket {
 
-    /** Session 池: userId → Session */
+    /** Session 池按连接 ID 保存；同一用户可同时打开主页面和独立导航页。 */
     private static final ConcurrentHashMap<String, Session> sessionPool = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, String> sessionUsers = new ConcurrentHashMap<>();
 
     /**
      * 每个 Session 独立写锁。
@@ -66,8 +67,9 @@ public class WebSocket {
     @OnOpen
     public void onOpen(Session session, @PathParam(value = "userId") String userId) {
         try {
-            sessionPool.put(userId, session);
-            sessionLocks.put(userId, new ReentrantLock());
+            sessionUsers.put(session.getId(), userId);
+            sessionLocks.put(session.getId(), new ReentrantLock());
+            sessionPool.put(session.getId(), session);
             log.info("【WS】连接建立 userId={}, 当前连接数={}", userId, sessionPool.size());
 
             if (userId.contains("rtsp")) {
@@ -81,10 +83,11 @@ public class WebSocket {
     }
 
     @OnClose
-    public void onClose(@PathParam("userId") String userId) {
+    public void onClose(Session session, @PathParam("userId") String userId) {
         try {
-            sessionPool.remove(userId);
-            sessionLocks.remove(userId);
+            sessionPool.remove(session.getId(), session);
+            sessionLocks.remove(session.getId());
+            sessionUsers.remove(session.getId());
             log.info("【WS】连接关闭 userId={}, 当前连接数={}", userId, sessionPool.size());
         } catch (Exception e) {
             log.error("【WS】onClose 异常", e);
@@ -92,7 +95,7 @@ public class WebSocket {
     }
 
     @OnMessage
-    public void onMessage(String message, @PathParam(value = "userId") String userId) {
+    public void onMessage(String message, Session session, @PathParam(value = "userId") String userId) {
         if (userId.contains("audio")) {
             log.info("【WS】收到 audio 消息");
             return;
@@ -105,7 +108,14 @@ public class WebSocket {
         JSONObject obj = new JSONObject();
         obj.put(WebsocketConst.MSG_CMD, WebsocketConst.CMD_CHECK);
         obj.put(WebsocketConst.MSG_TXT, "心跳响应");
-        pushMessage(userId, obj.toJSONString());
+        // 心跳只回复发起连接，不能让另一页面收到回复后误判本连接正常。
+        ReentrantLock lock = sessionLocks.get(session.getId());
+        if (lock != null && session.isOpen()) {
+            lock.lock();
+            try { session.getBasicRemote().sendText(obj.toJSONString()); }
+            catch (Exception e) { log.debug("【WS】心跳回复失败: {}", e.getMessage()); }
+            finally { lock.unlock(); }
+        }
     }
 
     @OnError
@@ -178,7 +188,8 @@ public class WebSocket {
      */
     public void pushMessage(String userId, String message) {
         for (Map.Entry<String, Session> entry : sessionPool.entrySet()) {
-            if (!entry.getKey().contains(userId)) continue;
+            String recipient = sessionUsers.get(entry.getKey());
+            if (recipient == null || !recipient.contains(userId)) continue;
 
             Session session = entry.getValue();
             ReentrantLock lock = sessionLocks.get(entry.getKey());

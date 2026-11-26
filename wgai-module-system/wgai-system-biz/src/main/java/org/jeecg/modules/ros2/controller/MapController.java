@@ -268,7 +268,7 @@ public class MapController {
 
     @PostMapping("/load")
     @ApiOperation("切换到指定地图(通过 Nav2 service 热切换,无需重启)")
-    public Result<Map<String, Object>> loadMap(@RequestBody Map<String, Object> params) {
+    public synchronized Result<Map<String, Object>> loadMap(@RequestBody Map<String, Object> params) {
         long t0 = System.currentTimeMillis();
         log.info("====== [load] 进入 loadMap, params={} ======", params);
         if (!mapLoading.compareAndSet(false, true)) {
@@ -343,6 +343,7 @@ public class MapController {
             scheduleHealthCheck(mapName);
 
             loadedMapName = mapName;
+            navigationPushService.clearNavigationSnapshot();
             log.info("[load] step8 组装响应并返回 (总+{}ms)", System.currentTimeMillis() - t0);
 
             // 8. 提示用户:如果机器人位置不准,需调用全局重定位
@@ -472,7 +473,7 @@ public class MapController {
         Map<String, Object> s = new LinkedHashMap<>();
         boolean active = isNav2Active();
         s.put("nav2Running",  active);
-        s.put("loadedMap",    loadedMapName);
+        s.put("loadedMap",    navigationMapName());
         s.put("poseSaving",   poseAutoSaveScheduler != null
                 && !poseAutoSaveScheduler.isShutdown());
         s.put("startupHint",  active
@@ -510,7 +511,7 @@ public class MapController {
         // 此时只要 rosbridge 连接正常就认为 Nav2 在跑(load_map 调用会进一步验证)
         if (ros2BridgeService.isConnected()) {
             // ⚠ 这条不代表定位坏了：AMCL 只在车移动超过 update_min_d/a 才发 /amcl_pose，车停着超过 60s 必然"超时"
-            log.info("[isNav2Active] rosbridge 已连接, 60s 内没有新的 /amcl_pose(车静止时正常), 按 Nav2 活跃处理");
+            log.debug("[isNav2Active] rosbridge 已连接，AMCL未近期更新；按连接状态兼容手动启动，不能据此确认定位可用");
             return true;
         }
 
@@ -879,18 +880,10 @@ public class MapController {
                 + "    max_particles: 2000\n"
                 + "    min_particles: 500\n"
                 + "    robot_model_type: nav2_amcl::DifferentialMotionModel\n"
-                // AMCL 发的 map→camera_init TF,时间戳 = 它处理的那帧 scan 的时间戳 + 本值。
-                // 值太小 → TF 早于当前时刻过期 → controller_server 查 map→camera_init 报
-                //   [tf_help] Transform data too old when converting from map to camera_init
-                // ⚠ 而 nav2 的 ControllerServer::isGoalReached() **不检查这次转换的返回值**:
-                //     transformPose(tf, "camera_init", end_pose_, transformed_end_pose, tol);
-                //     return goal_checker_->isGoalReached(pose, transformed_end_pose.pose, vel);
-                //   转换失败时 transformed_end_pose 保持默认的 (0,0,0),而 camera_init 原点
-                //   就是 fast_lio 启动时车所在位置 —— 车还没走远就落在 xy_goal_tolerance(0.25m)
-                //   以内 → 直接判定"Reached the goal!"。
-                //   2026-08 现场就是这样:路径正常算出、车动了 1.3s、TF 一超时立刻报导航完成。
-                // 所以这个值必须覆盖住 AMCL 的实际处理滞后,2.0 是留了余量的兜底。
-                + "    transform_tolerance: 2.0\n"
+                // AMCL publishes scan_stamp + tolerance, not receipt time. Excessive future
+                // dating leaves newly created TF buffers unable to transform current scans.
+                // Reduce scan queues too; never hide old data by replacing its timestamp.
+                + "    transform_tolerance: 0.3\n"
                 + "    update_min_a: 0.2\n"
                 + "    update_min_d: 0.25\n"
                 + "    tf_broadcast: true\n"
@@ -1239,15 +1232,19 @@ public class MapController {
         long t0 = System.currentTimeMillis();
         // 日志里只打印命令尾部,避免 source 那串噪音刷屏
         String shortCmd = cmd.length() > 120 ? "..." + cmd.substring(cmd.length() - 120) : cmd;
-        log.warn("[runCommand] 开始(超时{}s): {}", timeoutSec, shortCmd);
-        log.warn("[runCommand] 执行的内容：{}", cmd);
+        log.debug("[runCommand] 开始(超时{}s): {}", timeoutSec, shortCmd);
         // 用 setsid 让 bash 自成新会话/进程组,这样命令里的 `timeout -s KILL N`
         // 杀进程时能干净地带走 ros2/python 子孙,不会残留孤儿占着流。
         ProcessBuilder pb = new ProcessBuilder("setsid", "bash", "-c", cmd);
         cleanCondaEnv(pb.environment());
         pb.environment().put("QT_QPA_PLATFORM", "offscreen");
         pb.redirectErrorStream(true);
-        Process p = pb.start();
+        Process p;
+        try { p = pb.start(); }
+        catch (IOException e) {
+            log.warn("[runCommand] 启动失败 cmd尾={} 原因={}", shortCmd, e.getMessage());
+            throw e;
+        }
 
         // ★ 关键修复:在后台线程里读 stdout。
         //   原来的写法是在主线程 while(readLine()) 里读流,readLine 会一直阻塞到
@@ -1280,8 +1277,17 @@ public class MapController {
 
         String out;
         synchronized (sb) { out = sb.toString(); }
-        log.warn("[runCommand] 结束 finished={} 耗时={}ms 输出{}字节",
-                finished, System.currentTimeMillis() - t0, out.length());
+        int exitCode = finished ? p.exitValue() : -1;
+        boolean inactiveQuery = cmd.startsWith("systemctl is-active ")
+                && out.trim().matches("inactive|unknown|activating|deactivating");
+        if (finished && exitCode != 0 && !inactiveQuery) {
+            log.warn("[runCommand] 非零退出 exit={} 耗时={}ms cmd尾={} 输出={}",
+                    exitCode, System.currentTimeMillis()-t0, shortCmd,
+                    out.length()>500 ? out.substring(0,500) : out);
+        } else {
+            log.debug("[runCommand] 结束 finished={} exit={} 耗时={}ms 输出{}字符",
+                    finished, exitCode, System.currentTimeMillis()-t0, out.length());
+        }
         return out;
     }
 
@@ -1361,7 +1367,7 @@ public class MapController {
                 m.put("name",          name);
                 m.put("createTime",    f.lastModified());
                 m.put("hasImage",      new File(MAP_DIR + name + ".pgm").exists());
-                m.put("loaded",        name.equals(loadedMapName));
+                m.put("loaded",        name.equals(currentMapName()));
                 m.put("hasSavedPose",  new File(MAP_DIR + name + POSE_FILE_SUFFIX).exists());
                 list.add(m);
             }
@@ -1463,37 +1469,19 @@ public class MapController {
     // ===================== 删除地图 =====================
 
     @DeleteMapping("/{mapName}")
-    @ApiOperation("删除地图(yaml + pgm + png + 位姿文件)")
-    public Result<Void> deleteMap(@PathVariable String mapName) {
+    @ApiOperation("删除未使用的地图及图像、位姿、擦除备份文件")
+    public synchronized Result<Void> deleteMap(@PathVariable String mapName) {
         try {
-            // 不允许删除当前正在使用的地图
-            if (mapName.equals(loadedMapName)) {
-                return Result.error("不能删除当前正在使用的地图,请先切换到其他地图");
-            }
-            // 不允许通过此接口删除 last_used 软链接
-            if (LAST_USED_LINK.equals(mapName + ".yaml")) {
-                return Result.error("last_used 是系统维护的软链接,不能直接删除");
-            }
-            boolean deleted = false;
-            for (String ext : new String[]{".yaml", ".pgm", ".png", POSE_FILE_SUFFIX, ERASE_ORIG_SUFFIX, ERASE_LOG_SUFFIX}) {
-                File f = new File(MAP_DIR + mapName + ext);
-                if (f.exists()) deleted |= f.delete();
-            }
-            // 如果删除的恰好是 last_used 当前指向的地图,把链接也清掉,避免悬空
-            try {
-                Path link = Paths.get(MAP_DIR, LAST_USED_LINK);
-                if (Files.isSymbolicLink(link)) {
-                    Path target = Files.readSymbolicLink(link);
-                    if (target.getFileName().toString().equals(mapName + ".yaml")) {
-                        Files.deleteIfExists(link);
-                        log.info("已清理悬空的 last_used 软链接(原指向已删除的 {})", mapName);
-                    }
-                }
-            } catch (Exception ignored) {}
-            return deleted ? Result.OK("地图已删除")
-                    : Result.error("地图文件不存在: " + mapName);
+            String active = currentMapName();
+            int count = org.jeecg.modules.ros2.service.MapFileStore.delete(
+                    Paths.get(MAP_DIR), mapName, active);
+            if (count == 0) return Result.error("地图文件不存在: " + mapName);
+            StaticGrid cached = staticGrid;
+            if (cached != null && mapName.equals(cached.name)) staticGrid = null;
+            log.info("[删除地图] name={} files={}", mapName, count);
+            return Result.OK("地图已删除(" + count + "个文件)");
         } catch (Exception e) {
-            log.error("删除地图失败", e);
+            log.warn("删除地图失败: {} {}", mapName, e.getMessage());
             return Result.error("删除失败: " + e.getMessage());
         }
     }
@@ -1691,6 +1679,14 @@ public class MapController {
     private volatile StaticGrid staticGrid;
 
     /** 当前地图名。loadedMapName 为空(Java 重启后还没切过图)时按 last_used.yaml 软链接找；都没有返回 null */
+    @Autowired
+    private org.jeecg.modules.ros2.service.WebSocketPushService navigationPushService;
+
+    public String navigationMapName() {
+        try { return currentMapName(); }
+        catch (IOException e) { log.debug("读取当前地图名失败: {}", e.getMessage()); return loadedMapName; }
+    }
+
     private String currentMapName() throws IOException {
         String name = loadedMapName;
         if (name == null) {
@@ -1788,7 +1784,7 @@ public class MapController {
         return pts.size() + " 个障碍格，如" + sample;
     }
 
-    /** 多边形内压到的障碍格(含图外)中心坐标，最多 max 个；地图不可用返回空表(不拦) */
+    /** 多边形内压到的障碍格(含图外)中心坐标，最多 max 个；地图不可用抛出异常，禁止把缺失数据当成畅通 */
     public List<double[]> staticMapOccupiedPoints(double[][] poly, int max) {
         List<double[]> out = new ArrayList<>();
         scanOccupied(poly, max, out);
@@ -1800,29 +1796,39 @@ public class MapController {
         return scanOccupied(poly, 1, null) > 0;
     }
 
+    public double getStaticMapResolution() {
+        try {
+            StaticGrid g = currentStaticGrid();
+            if (g == null) throw new IllegalStateException("当前静态地图不可用，无法检查车身压线");
+            return g.res;
+        } catch (IOException e) { throw new IllegalStateException("读取静态地图失败: " + e.getMessage(), e); }
+    }
+
     private int scanOccupied(double[][] poly, int max, List<double[]> out) {
         try {
             StaticGrid g = currentStaticGrid();
-            if (g == null) return 0;
+            if (g == null) throw new IllegalStateException("当前静态地图不可用，无法检查车身压线");
             double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE, maxX = -Double.MAX_VALUE, maxY = -Double.MAX_VALUE;
             for (double[] p : poly) {
                 minX = Math.min(minX, p[0]); maxX = Math.max(maxX, p[0]);
                 minY = Math.min(minY, p[1]); maxY = Math.max(maxY, p[1]);
             }
+            int c0 = (int) Math.floor((minX - g.ox) / g.res) - 1, c1 = (int) Math.floor((maxX - g.ox) / g.res);
+            int r0 = (int) Math.floor((minY - g.oy) / g.res) - 1, r1 = (int) Math.floor((maxY - g.oy) / g.res);
             int hits = 0;
-            for (double y = minY; y <= maxY; y += g.res) {
-                for (double x = minX; x <= maxX; x += g.res) {
-                    if (!insidePolygon(poly, x, y)) continue;
-                    int c = (int) Math.floor((x - g.ox) / g.res), r = (int) Math.floor((y - g.oy) / g.res);
-                    if (c < 0 || r < 0 || c >= g.w || r >= g.h || g.occupied[r * g.w + c]) {
-                        if (out != null) out.add(new double[]{x, y});
-                        if (++hits >= max) return hits;
-                    }
+            for (int r = r0; r <= r1; r++) {
+                for (int c = c0; c <= c1; c++) {
+                    boolean occupied = c < 0 || r < 0 || c >= g.w || r >= g.h || g.occupied[r * g.w + c];
+                    if (!occupied) continue;
+                    double x = g.ox + (c + 0.5) * g.res, y = g.oy + (r + 0.5) * g.res;
+                    if (!org.jeecg.modules.ros2.service.NavigationGeometry.cellIntersects(poly, x, y, g.res)) continue;
+                    if (out != null) out.add(new double[]{x, y});
+                    if (++hits >= max) return hits;
                 }
             }
             return hits;
-        } catch (Exception e) {
-            return 0;
+        } catch (IOException e) {
+            throw new IllegalStateException("读取静态地图失败: " + e.getMessage(), e);
         }
     }
 

@@ -167,6 +167,7 @@ public class TabAiSubscriptionNewServiceImpl extends ServiceImpl<TabAiSubscripti
     }
 
     private void markStopped(String id) {
+        SubscriptionHeartbeatState.stopped(id);
         RedisCacheHolder.put(id + "newRunPush", false);
         try { redisTemplate.opsForValue().set(id + "newRunPush", false); }
         catch (Exception e) { log.warn("[运行状态缓存更新失败] taskId={}", id, e); }
@@ -309,6 +310,7 @@ public class TabAiSubscriptionNewServiceImpl extends ServiceImpl<TabAiSubscripti
         if (ACTIVE_TASKS.size() >= 64) throw new IllegalStateException("识别任务已达到64路上限");
         TabAiSubscriptionNew task = getById(id);
         if (task == null) throw new IllegalArgumentException("任务不存在: " + id);
+        org.jeecg.modules.demo.video.util.InferenceOptions.validate(task);
         try {
             startAiInternal(task);
             log.info("[任务已提交] taskId={} name={} active={}", id, task.getName(), ACTIVE_TASKS.size());
@@ -323,6 +325,7 @@ public class TabAiSubscriptionNewServiceImpl extends ServiceImpl<TabAiSubscripti
      *   完全停止流
      */
     private void stopStreamCompletely(String streamId) {
+        SubscriptionHeartbeatState.stopped(streamId);
         log.info("[完全停止] ID: {}, 活跃流: {}/64", streamId, ACTIVE_TASKS.size());
 
         Runnable stop = STOP_ACTIONS.remove(streamId);
@@ -509,26 +512,20 @@ public class TabAiSubscriptionNewServiceImpl extends ServiceImpl<TabAiSubscripti
 
             log.info("[开始推理]{}-共{}路", tabAiSubscriptionNew.getName(), cameraNum);
 
-            if (tabAiSubscriptionNew.getModelJmType() != null && tabAiSubscriptionNew.getModelJmType() == 20) {  //onnx
-                log.info("onnx推理");
-                if (cameraNum == null || cameraNum < 32) {
-                    submitVideoTask(tabAiSubscriptionNew, new VideoReadPicOnnxNew(tabAiSubscriptionNew, redisTemplate, frameIntervalMs, maxStreamLagMs));
-                } else if (cameraNum == 32) {
-                    submitGenericTask(tabAiSubscriptionNew, new VideoReadPicNewThreeTwoOnnx(tabAiSubscriptionNew, redisTemplate));
-                } else {
-                    submitGenericTask(tabAiSubscriptionNew, new VideoReadPicOnnxNewBatch(tabAiSubscriptionNew, redisTemplate, batchScheduler));
-                }
-            } else { // opencv
-                log.info("opencv dnn推理");
-                if (cameraNum == null || cameraNum < 32) {
-                    submitGenericTask(tabAiSubscriptionNew, new VideoReadPicNew(tabAiSubscriptionNew, redisTemplate, opencvFrameIntervalMs, maxStreamLagMs));
-                } else if (cameraNum == 32) {
-                    submitGenericTask(tabAiSubscriptionNew, new VideoReadPicNewThreeTwo(tabAiSubscriptionNew, redisTemplate));
-                } else {
-                    throw new IllegalArgumentException("OpenCV模式不支持cameraNum大于32");
-                }
+            // 推理后端和是否批量由订阅配置决定，与 cameraNum 无关。
+            if (AscendOmPool.isOmModel(tabAiSubscriptionNew.getModelJmType())
+                    || (Integer.valueOf(20).equals(tabAiSubscriptionNew.getModelJmType())
+                    && needsOnnxBatchReader(tabAiSubscriptionNew, NetPushList))) {
+                log.info("[订阅推理] backend={} queue={} batch={} waitMs={}", tabAiSubscriptionNew.getModelJmType(),
+                        org.jeecg.modules.demo.video.util.InferenceOptions.capacity(tabAiSubscriptionNew),
+                        org.jeecg.modules.demo.video.util.InferenceOptions.batchSize(tabAiSubscriptionNew),
+                        org.jeecg.modules.demo.video.util.InferenceOptions.waitMs(tabAiSubscriptionNew));
+                submitGenericTask(tabAiSubscriptionNew, new VideoReadPicOnnxNewBatch(tabAiSubscriptionNew, redisTemplate, batchScheduler));
+            } else if (Integer.valueOf(20).equals(tabAiSubscriptionNew.getModelJmType())) {
+                submitVideoTask(tabAiSubscriptionNew, new VideoReadPicOnnxNew(tabAiSubscriptionNew, redisTemplate, frameIntervalMs, maxStreamLagMs));
+            } else {
+                submitGenericTask(tabAiSubscriptionNew, new VideoReadPicNew(tabAiSubscriptionNew, redisTemplate, opencvFrameIntervalMs, maxStreamLagMs));
             }
-
         } catch (IOException ex) {
             throw new IllegalStateException("模型配置文件读取失败", ex);
         }
@@ -537,6 +534,27 @@ public class TabAiSubscriptionNewServiceImpl extends ServiceImpl<TabAiSubscripti
     /**
      *   提交视频任务并跟踪（支持VideoReadPicOnnxNew类型）
      */
+    private boolean needsOnnxBatchReader(TabAiSubscriptionNew tab, List<NetPush> models) {
+        boolean required = false;
+        for (NetPush model : models) {
+            if (model.getListNetPush() != null && !model.getListNetPush().isEmpty()) {
+                required |= needsOnnxBatchReader(tab, model.getListNetPush());
+                continue;
+            }
+            try {
+                TensorInfo info = (TensorInfo) model.getSession().getInputInfo().values().iterator().next().getInfo();
+                long[] shape = info.getShape();
+                if (shape.length != 4) throw new IllegalArgumentException("需要NCHW模型输入，实际=" + Arrays.toString(shape));
+                int effective = TensorBatch.effectiveSize(InferenceOptions.batchEnabled(tab), shape[0], InferenceOptions.batchSize(tab));
+                log.info("[模型批量能力] taskId={} model={} input={} enabled={} actualBatch={}", tab.getId(),
+                        model.getTabAiModel().getAiName(), Arrays.toString(shape), InferenceOptions.batchEnabled(tab), effective);
+                // 固定多图模型即使关闭凑批，也需要补齐输入；真实结果仍只返回一张。
+                required |= shape[0] > 1 || effective > 1;
+            } catch (OrtException e) { throw new IllegalStateException("无法读取ONNX模型输入", e); }
+        }
+        return required;
+    }
+
     private void submitVideoTask(TabAiSubscriptionNew tab, VideoReadPicOnnxNew task) {
         submitGenericTask(tab, task);
     }
@@ -554,6 +572,7 @@ public class TabAiSubscriptionNewServiceImpl extends ServiceImpl<TabAiSubscripti
             @Override protected void done() {
                 synchronized (TabAiSubscriptionNewServiceImpl.this) {
                     if (ACTIVE_TASKS.remove(id, this)) {
+                        SubscriptionHeartbeatState.stopped(id);
                         STOP_ACTIONS.remove(id);
                         if (!shuttingDown) {
                             try { markStopped(id); }
@@ -572,14 +591,31 @@ public class TabAiSubscriptionNewServiceImpl extends ServiceImpl<TabAiSubscripti
         else if (task instanceof VideoReadPicNewThreeTwoOnnx) stop = ((VideoReadPicNewThreeTwoOnnx) task)::forceStop;
         else if (task instanceof VideoReadPicOnnxNewBatch) stop = ((VideoReadPicOnnxNewBatch) task)::forceStop;
         if (stop != null) STOP_ACTIONS.put(id, stop);
+        SubscriptionHeartbeatState.started(tab);
         ACTIVE_TASKS.put(id, future);
         try { executor.execute(future); }
         catch (RuntimeException e) {
             ACTIVE_TASKS.remove(id, future);
+            SubscriptionHeartbeatState.stopped(id);
             Runnable cleanup = STOP_ACTIONS.remove(id);
             if (cleanup != null) cleanup.run();
             throw e;
         }
+    }
+
+    @Override
+    public int syncHeartbeatToOthers(TabAiSubscriptionNew source) {
+        int affected = baseMapper.update(null, SubscriptionHeartbeatConfigSync.toOthers(source));
+        Runnable refresh = SubscriptionHeartbeatState::configurationChanged;
+        if (org.springframework.transaction.support.TransactionSynchronizationManager.isSynchronizationActive()) {
+            org.springframework.transaction.support.TransactionSynchronizationManager.registerSynchronization(
+                    new org.springframework.transaction.support.TransactionSynchronization() {
+                        @Override public void afterCommit() { refresh.run(); }
+                    });
+        } else refresh.run();
+        log.info("[保活配置同步] sourceId={} enabled={} intervalSeconds={} affected={}，仅更新五项保活字段",
+                source.getId(), source.getHeartbeatEnabled(), source.getHeartbeatIntervalSeconds(), affected);
+        return affected;
     }
 
     public TabAiModel getTabAiModelInfo(TabAiModel tabAiModel, String name) {

@@ -22,6 +22,6 @@ public final class RecognitionTrace {
         return trace;
     }
     public static RecognitionTrace current() { return CURRENT.get(); }
-    public static void clear() { CURRENT.remove(); }
+    public static void clear() { CURRENT.remove(); SubscriptionRuntimeStatus.clear(); }
     public long elapsedMillis() { return (System.nanoTime() - decodedNanos) / 1000000; }
 }

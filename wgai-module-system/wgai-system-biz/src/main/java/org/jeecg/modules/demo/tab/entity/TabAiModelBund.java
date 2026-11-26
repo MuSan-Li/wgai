@@ -68,6 +68,31 @@ public class TabAiModelBund implements Serializable {
 	@Excel(name = "输入图片地址", width = 15)
     @ApiModelProperty(value = "输入图片地址")
     private java.lang.String sendUrl;
+    /**识别方式：仅保存配置，当前不参与识别流程*/
+    @Excel(name = "识别方式", width = 20, dicCode = "video_recognition_mode")
+    @ApiModelProperty(value = "识别方式：1视频流识别，2视频流推送重组")
+    @Dict(dicCode = "video_recognition_mode")
+    private java.lang.String recognitionMode;
+
+    /**Python 推理输入源，与 sendUrl 默认播放地址独立*/
+    @ApiModelProperty(value = "推理视频流地址，仅保存配置")
+    private java.lang.String inferenceVideoUrl;
+
+    @ApiModelProperty(value = "ZLM 推流地址，仅保存配置")
+    private java.lang.String zlmPushUrl;
+
+    @ApiModelProperty(value = "每秒抽取的推理帧数，1至60，建议3")
+    private java.lang.Integer inferenceFps;
+
+    @ApiModelProperty(value = "共享 Python 脚本文件路径，仅保存引用，不执行")
+    private java.lang.String pythonScriptPath;
+
+    @ApiModelProperty(value = "是否使用 NVIDIA GPU 解码：0关闭，1开启")
+    private java.lang.Integer gpuDecode;
+
+    @ApiModelProperty(value = "视频流重组执行方式：java或python，默认java")
+    private java.lang.String executionEngine;
+
 	/**保存图片地址*/
 	@Excel(name = "保存图片地址", width = 15)
     @ApiModelProperty(value = "保存图片地址")

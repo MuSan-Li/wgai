@@ -69,6 +69,11 @@ import static org.jeecg.modules.tab.AIModel.pose.FallDetectionResult.detectFallO
  */
 @Slf4j
 public class identifyTypeNewOnnxTest {
+    private static final class NativeMats implements AutoCloseable {
+        private final List<Mat> owned = new ArrayList<>();
+        <T extends Mat> T keep(T mat) { owned.add(mat); return mat; }
+        public void close() { for (int i = owned.size()-1; i >= 0; i--) owned.get(i).release(); }
+    }
 
     // ========================================
     // 目标跟踪配置常量
@@ -175,6 +180,7 @@ public class identifyTypeNewOnnxTest {
         try {
             detectionResult = runOnnxInference(session, env, inputData, expectedClassCount,thresshold);
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             log.error("ONNX推理失败", ex);
             return false;
         }
@@ -390,6 +396,7 @@ public class identifyTypeNewOnnxTest {
                     finalAudio, stats.warnNumber, warnText, stats.warnName, savePath, modelArea);
             return true;
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             log.error("推送失败", ex);
             return false;
         }
@@ -458,7 +465,7 @@ public class identifyTypeNewOnnxTest {
         OrtEnvironment env = netPush.getEnv();
 
 
-        try (OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(inputData), new long[]{1, 3, 640, 640})) {
+        try (NativeMats mats = new NativeMats(); OnnxTensor inputTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(inputData), new long[]{1, 3, 640, 640})) {
             Map<String, OnnxTensor> inputs = Collections.singletonMap(
                     session.getInputNames().iterator().next(), inputTensor);
 
@@ -469,6 +476,7 @@ public class identifyTypeNewOnnxTest {
             List<float[]> keypoints = new ArrayList<>();
 
             try (OrtSession.Result results = session.run(inputs)) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
                 for (Map.Entry<String, OnnxValue> entry : results) {
                     OnnxValue value = entry.getValue();
                     if (!(value instanceof OnnxTensor)) continue;
@@ -567,7 +575,7 @@ public class identifyTypeNewOnnxTest {
                                         debugCount++;
                                     }
 
-                                    //  关键过滤条件 
+                                    //  关键过滤条件
                                     boolean hasValidKeypoints = false;
 
                                     if (highVisibilityCount >= 3) {
@@ -688,10 +696,11 @@ public class identifyTypeNewOnnxTest {
                 return false;
             }
             //  应用非极大值抑制
-            MatOfRect2d boxesMat = new MatOfRect2d();
+            MatOfRect2d boxesMat = mats.keep(new MatOfRect2d());
             boxesMat.fromList(boxes2d);
-            MatOfFloat confidencesMat = new MatOfFloat(Converters.vector_float_to_Mat(confidences));
-            MatOfInt indices = new MatOfInt();
+            MatOfFloat confidencesMat = mats.keep(new MatOfFloat());
+            confidencesMat.fromList(confidences);
+            MatOfInt indices = mats.keep(new MatOfInt());
 
             if (!boxesMat.empty() && !confidencesMat.empty()) {
                 Dnn.NMSBoxes(boxesMat, confidencesMat, confThreshold, nmsThreshold, indices);
@@ -892,10 +901,12 @@ public class identifyTypeNewOnnxTest {
                         finalAudio, stats.warnNumber, warnText, stats.warnName, savePath, modelArea);
                 return true;
             } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
                 log.error("推送失败", ex);
                 return false;
             }
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             log.error("ONNX推理失败", ex);
             return false;
         }
@@ -974,7 +985,8 @@ public class identifyTypeNewOnnxTest {
                 continue;
             }
 
-            Mat croppedMat = cropResult.croppedImage;
+            try (NativeMats mats = new NativeMats()) {
+            Mat croppedMat = mats.keep(cropResult.croppedImage);
             Rect cropRect = cropResult.cropRect;
 
             //   保存调试图（可选）
@@ -984,7 +996,7 @@ public class identifyTypeNewOnnxTest {
 
             //   智能缩放：保持宽高比
             ResizeResult resizeResult = smartResize(croppedMat, 640);
-            Mat resizedMat = resizeResult.resizedImage;
+            Mat resizedMat = mats.keep(resizeResult.resizedImage);
             //   修复：BGR → RGB
             Imgproc.cvtColor(resizedMat, resizedMat, Imgproc.COLOR_BGR2RGB);
             // 预处理
@@ -997,16 +1009,17 @@ public class identifyTypeNewOnnxTest {
                 detectionResult = runOnnxInferenceROI(session, env, inputData, expectedClassCount);
                 log.info("ROI[{}]检测到{}个候选框", roiIndex, detectionResult.boxes2d.size());
             } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
                 log.error("ROI[{}]推理失败", roiIndex, ex);
-                croppedMat.release();
-                resizedMat.release();
+
+
                 continue;
             }
 
             // NMS去重
             if (detectionResult.boxes2d.isEmpty()) {
-                croppedMat.release();
-                resizedMat.release();
+
+
                 continue;
             }
 
@@ -1050,9 +1063,10 @@ public class identifyTypeNewOnnxTest {
                         originalX, originalY, originalW, originalH);
             }
 
+            } // ROI resource scope
             // 释放资源
-            croppedMat.release();
-            resizedMat.release();
+
+
         }
 
 
@@ -1075,6 +1089,7 @@ public class identifyTypeNewOnnxTest {
                     session.getInputNames().iterator().next(), inputTensor);
 
             try (OrtSession.Result results = session.run(inputs)) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
                 for (Map.Entry<String, OnnxValue> entry : results) {
                     if (!(entry.getValue() instanceof OnnxTensor)) continue;
 
@@ -1177,38 +1192,22 @@ public class identifyTypeNewOnnxTest {
      *   智能缩放：保持宽高比，用letterbox填充
      */
     private ResizeResult smartResize(Mat src, int targetSize) {
-        double srcWidth = src.cols();
-        double srcHeight = src.rows();
-
-        // 计算缩放比例（保持宽高比）
-        double scale = Math.min(targetSize / srcWidth, targetSize / srcHeight);
-
-        int newWidth = (int)(srcWidth * scale);
-        int newHeight = (int)(srcHeight * scale);
-
-        // 缩放
-        Mat resized = new Mat();
-        Imgproc.resize(src, resized, new Size(newWidth, newHeight));
-
-        // 计算padding
-        int padX = (targetSize - newWidth) / 2;
-        int padY = (targetSize - newHeight) / 2;
-
-        // 创建目标图像（灰色背景）
-        Mat output = new Mat(targetSize, targetSize, src.type(), new Scalar(114, 114, 114));
-
-        // 将缩放后的图像放到中心
-        Mat roi = output.submat(padY, padY + newHeight, padX, padX + newWidth);
-        try { resized.copyTo(roi); } finally { roi.release(); }
-
-        ResizeResult result = new ResizeResult();
-        result.resizedImage = output;
-        result.scale = scale;
-        result.padX = padX;
-        result.padY = padY;
-
-        resized.release();
-        return result;
+        try (NativeMats mats = new NativeMats()) {
+            double scale = Math.min((double) targetSize / src.cols(), (double) targetSize / src.rows());
+            int width = Math.max(1, (int)(src.cols() * scale));
+            int height = Math.max(1, (int)(src.rows() * scale));
+            Mat resized = mats.keep(new Mat());
+            Imgproc.resize(src, resized, new Size(width, height));
+            int padX = (targetSize-width)/2, padY = (targetSize-height)/2;
+            Mat output = new Mat(targetSize, targetSize, src.type(), new Scalar(114,114,114));
+            try {
+                Mat roi = mats.keep(output.submat(padY,padY+height,padX,padX+width));
+                resized.copyTo(roi);
+                ResizeResult result = new ResizeResult();
+                result.resizedImage=output; result.scale=scale; result.padX=padX; result.padY=padY;
+                return result;
+            } catch (RuntimeException | Error ex) { output.release(); throw ex; }
+        }
     }
 
     /**
@@ -1344,6 +1343,7 @@ public class identifyTypeNewOnnxTest {
                     finalAudio, stats.warnNumber, stats.warnText, stats.warnName, savePath, modelArea);
             return true;
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             log.error("推送失败", ex);
             return false;
         }
@@ -1500,10 +1500,12 @@ public class identifyTypeNewOnnxTest {
                                     try {
                                         Files.deleteIfExists(path);
                                     } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
                                         e.printStackTrace();
                                     }
                                 });
                     } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
                         ex.printStackTrace();
                     }
                 }).start();
@@ -1513,6 +1515,7 @@ public class identifyTypeNewOnnxTest {
             Imgcodecs.imwrite(filename, roiMat);
             log.info("ROI[{}]已保存至: {}", roiIndex, filename);
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             log.error("保存ROI失败", ex);
         }
     }
@@ -1619,6 +1622,7 @@ public class identifyTypeNewOnnxTest {
         try {
             detectionResult = runOnnxInference(session, env, inputData, expectedClassCount,confThreshold);
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             log.error("ONNX推理失败", ex);
             return returnBox;
         }
@@ -1818,6 +1822,7 @@ public class identifyTypeNewOnnxTest {
                         JSONObject ob = RestUtil.post(pushInfo.getEventUrl(), (JSONObject) JSONObject.toJSON(push));
                         log.info("第三方返回：{}", ob);
                     } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
                         log.error("[第三方推送失败] taskId={}", pushInfo.getId(), e);
                     }
 
@@ -1836,6 +1841,7 @@ public class identifyTypeNewOnnxTest {
 
 
             } catch (Exception exception) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(exception);
                 log.error("[报警处理失败] taskId={}", pushInfo.getId(), exception);
             }
         });
@@ -1963,6 +1969,7 @@ public class identifyTypeNewOnnxTest {
             grabber.release();
             log.info("录制完成保存为{}", path);
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             ex.printStackTrace();
             log.error("[出错了检查一下]");
             return "";
@@ -2023,6 +2030,7 @@ public class identifyTypeNewOnnxTest {
                 List<Mat> result = new ArrayList<>();
                 List<String> outBlobNames = net.getUnconnectedOutLayersNames();
                 net.forward(result, outBlobNames);
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
 
                 // 处理检测结果
                 float confThreshold = 0.42f;
@@ -2133,6 +2141,7 @@ public class identifyTypeNewOnnxTest {
 //            tt.join();
             return saveMp4Path + "/avi.mp4";
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             ex.printStackTrace();
             log.error("录制失败");
             return "";
@@ -2195,6 +2204,7 @@ public class identifyTypeNewOnnxTest {
                     session.getInputNames().iterator().next(), inputTensor);
 
             try (OrtSession.Result results = session.run(inputs)) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
                 for (Map.Entry<String, OnnxValue> entry : results) {
                     if (!(entry.getValue() instanceof OnnxTensor)) continue;
 
@@ -2301,17 +2311,21 @@ public class identifyTypeNewOnnxTest {
      * NMS处理
      */
     private int[] performNMSROI(DetectionResult result, float confThreshold, float nmsThreshold) {
-        MatOfRect2d boxesMat = new MatOfRect2d();
+        try (NativeMats mats = new NativeMats()) {
+        MatOfRect2d boxesMat = mats.keep(new MatOfRect2d());
         boxesMat.fromList(result.boxes2d);
 
-        MatOfFloat confidencesMat = new MatOfFloat(Converters.vector_float_to_Mat(result.confidences));
-        MatOfInt indices = new MatOfInt();
+        MatOfFloat confidencesMat = mats.keep(new MatOfFloat());
+        confidencesMat.fromList(result.confidences);
+        MatOfInt indices = mats.keep(new MatOfInt());
 
         if (!boxesMat.empty() && !confidencesMat.empty()) {
             Dnn.NMSBoxes(boxesMat, confidencesMat, confThreshold, nmsThreshold, indices);
         }
 
         return indices.toArray();
+
+        }
     }
 
     /**
@@ -2638,6 +2652,7 @@ public class identifyTypeNewOnnxTest {
             return null;
 
         } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("【matchShapeAreaInfo】解析失败", e);
             return null;
         }
@@ -2915,6 +2930,7 @@ public class identifyTypeNewOnnxTest {
                 }
             }
         } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("【绘制区域】绘制失败", e);
         }
 
@@ -2994,43 +3010,21 @@ public class identifyTypeNewOnnxTest {
 
     }
     public static Mat letterboxResize(Mat image, int targetWidth, int targetHeight) {
-        int originalWidth = image.cols();
-        int originalHeight = image.rows();
-
-        // 计算缩放比例
-        double scale = Math.min((double) targetWidth / originalWidth, (double) targetHeight / originalHeight);
-
-        // 计算新的尺寸
-        int newWidth = (int) (originalWidth * scale);
-        int newHeight = (int) (originalHeight * scale);
-
-        // 缩放图像
-        Mat resized = new Mat();
+        if (image == null || image.empty() || targetWidth <= 0 || targetHeight <= 0)
+            throw new IllegalArgumentException("Letterbox requires a nonempty image and positive target size");
+        double scale=Math.min((double)targetWidth/image.cols(),(double)targetHeight/image.rows());
+        int width=Math.max(1,(int)(image.cols()*scale)), height=Math.max(1,(int)(image.rows()*scale));
+        Mat resized=new Mat(), canvas=null, roi=null;
+        boolean returned=false;
         try {
-
-            Imgproc.resize(image, resized, new Size(newWidth, newHeight));
-
-            // 创建目标尺寸的画布（灰色填充）
-            Mat letterboxed = new Mat(targetHeight, targetWidth, image.type(), new Scalar(114, 114, 114));
-
-            // 计算居中位置
-            int dx = (targetWidth - newWidth) / 2;
-            int dy = (targetHeight - newHeight) / 2;
-
-            // 将缩放后的图像复制到画布中心
-            Rect roi = new Rect(dx, dy, newWidth, newHeight);
-            Mat roiMat = new Mat(letterboxed, roi);
-            try {
-                resized.copyTo(roiMat);
-                return letterboxed;
-            } finally {
-                roiMat.release();
-            }
-
+            Imgproc.resize(image,resized,new Size(width,height));
+            canvas=new Mat(targetHeight,targetWidth,image.type(),new Scalar(114,114,114));
+            roi=new Mat(canvas,new Rect((targetWidth-width)/2,(targetHeight-height)/2,width,height));
+            resized.copyTo(roi);returned=true;return canvas;
         } finally {
-            if (resized != null) {
-                resized.release();
-            }
+            if(roi!=null)roi.release();
+            resized.release();
+            if(!returned && canvas!=null)canvas.release();
         }
     }
 
@@ -3154,6 +3148,7 @@ public class identifyTypeNewOnnxTest {
 
             return targets;
         } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("获取历史目标失败", e);
             return new ArrayList<>();
         }
@@ -3187,6 +3182,7 @@ public class identifyTypeNewOnnxTest {
 
             log.info("【保存目标】保存{}个目标到Redis", targets.size());
         } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("保存目标到Redis失败", e);
         }
     }

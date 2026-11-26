@@ -105,12 +105,42 @@ public class ManeuverService {
     @Value("${plc.maneuver.corridor-shift-max-m:0.6}")
     private volatile double corridorShiftMaxM;
 
+    @Value("${ros.navigation.localization-check-timeout-ms:8000}")
+    private long localizationCheckTimeoutMs = 8000;
+    @Value("${ros.navigation.localization-stable-updates:3}")
+    private int localizationStableUpdates = 3;
+    @Value("${ros.navigation.localization-max-correction-m:0.25}")
+    private double localizationMaxCorrectionM = 0.25;
+    @Value("${ros.navigation.localization-max-correction-deg:3.0}")
+    private double localizationMaxCorrectionDeg = 3.0;
+    // Only BEFORE a new goal, while odometry confirms stationary, allow bounded settling.
+    @Value("${ros.navigation.localization-settle-max-correction-m:1.0}")
+    private double localizationSettleMaxCorrectionM=1.0;
+    @Value("${ros.navigation.localization-settle-max-correction-deg:15.0}")
+    private double localizationSettleMaxCorrectionDeg=15.0;
+    private final AtomicLong preparationSequence = new AtomicLong();
+
+    private static final class StablePose {
+        final double[] pose;
+        final ROS2BridgeService.AmclSample sample;
+        StablePose(double[] pose, ROS2BridgeService.AmclSample sample) { this.pose = pose; this.sample = sample; }
+    }
+    private static final class LocalizationRefused extends Refused {
+        final Map<String, Object> data;
+        LocalizationRefused(String message, Map<String, Object> data) { super(message); this.data = data; }
+    }
+
     private static final class Mission {
         final long id;
+        final long startedAtMs = System.currentTimeMillis();
         final double gx, gy, gth, side;
         /** 精确停车：到达后原地转 + 平移对位；false = 到附近就算完成 */
         final boolean precise;
         volatile boolean aborted;
+        volatile boolean finished;
+        volatile ROS2BridgeService.AmclSample poseSample;
+        long unmatchedSinceMs;
+        long lastTimingLogMs;
         /** 当前在等哪次 Nav2 目标的结果：发目标时刻(纳秒)，0 = 没在等 */
         volatile long waitingSinceNs;
         volatile boolean shiftTried;
@@ -120,7 +150,7 @@ public class ManeuverService {
     }
 
     /** 拒绝执行：判定没过，车一动没动，可以放心走下一步(比如交给 Nav2) */
-    private static final class Refused extends Exception {
+    private static class Refused extends Exception {
         Refused(String m) { super(m); }
     }
 
@@ -130,6 +160,7 @@ public class ManeuverService {
 
     private final AtomicLong seq = new AtomicLong();
     private volatile Mission mission;
+    private final Object missionLock = new Object();
     private final ExecutorService worker = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(r, "maneuver");
         t.setDaemon(true);
@@ -156,6 +187,7 @@ public class ManeuverService {
     public void init() {
         bridge.addNavTerminalListener(this::onNavTerminal);
         bridge.addPlanListener(() -> lastPlanMs = System.currentTimeMillis());
+        timer.scheduleWithFixedDelay(this::monitorLocalization, 200, 200, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
     @PreDestroy
@@ -191,7 +223,18 @@ public class ManeuverService {
         if (Math.abs(s) > lateralMaxM) {
             throw new IllegalArgumentException(String.format("侧向对位 %.2fm 超过单次平移上限 %.2fm", s, lateralMaxM));
         }
-        double[] cur = bridge.getLastAmclPose();
+        long preparationId = preparationSequence.incrementAndGet();
+        StablePose checked;
+        try { checked = awaitStablePose(null, preparationId); }
+        catch (LocalizationRefused e) { throw new GoalRejectedException(e.getMessage(), e.data); }
+        catch (InterruptedException e) { Thread.currentThread().interrupt(); throw new IllegalArgumentException("定位检查被中断，本次目标未执行"); }
+        catch (Refused e) { throw new IllegalArgumentException(e.getMessage()); }
+        double[] cur = checked.pose;
+        Map<String, Object> startDiagnostic = collisionData(cur, mapController.getGlobalFootprintPadding(), "start");
+        if (((Number) startDiagnostic.get("bodyCount")).intValue() > 0) {
+            throw new GoalRejectedException("起点实车轮廓与静态地图障碍相交：" + startDiagnostic.get("sideSummary")
+                    + "。已标出命中格，请核对定位与地图，本次目标未执行", startDiagnostic);
+        }
         // 不指定朝向 = 车身轴线顺着"当前位置→目标"的连线：目标在车头这半边就车头朝行进方向(开过去)，
         // 在车尾这半边就车尾朝行进方向(倒过去，车头朝向基本不变)。
         //   · 纯方位角(v1)：点车后方变成要求掉头停车，倒几米的事被规划成绕一大圈(2026-09-14)
@@ -208,16 +251,19 @@ public class ManeuverService {
 
         double[] fit = findGoalFit(x, y, base, s, theta != null);
         if (fit == null) {
-            Map<String, Object> d = new java.util.LinkedHashMap<>();
-            d.put("x", x); d.put("y", y); d.put("theta", base);
-            List<double[]> hits = mapController.staticMapOccupiedPoints(footprintPoly(x, y, base, 0), 400);
-            d.put("hits", hits);
+            Map<String, Object> d = collisionData(new double[]{x, y, base}, 0, "goal");
+            if (((Number) d.get("bodyCount")).intValue() == 0 && s != 0) {
+                d = collisionData(new double[]{x + s * Math.sin(base), y - s * Math.cos(base), base}, 0, "preparation");
+            }
+            List<double[]> hits = (List<double[]>) d.get("hits");
             throw new GoalRejectedException(String.format(
                     "%s车身放不下(红框为车身，红点为压到的障碍格，共 %d 处)。%s",
                     theta != null ? "该朝向附近(±6°、横向±0.2m)" : "任何朝向", hits.size(),
                     theta != null ? "换位置，或拖箭头时对齐车位方向" : "离障碍远一点，或用「指定朝向目标」按车位方向拖"), d);
         }
         double gx = fit[0], gy = fit[1], th = fit[2];
+        Map<String, Object> targetDiagnostic = fit[4] == 0
+                ? collisionData(new double[]{gx, gy, th}, mapController.getGlobalFootprintPadding(), "goal") : null;
 
         StringBuilder note = new StringBuilder();
         double dTh = Math.toDegrees(wrap(th - base)), dLat = fit[3];
@@ -230,15 +276,24 @@ public class ManeuverService {
             note.append(String.format("车身四周余量不足 %.2fm(ros.nav2.footprint-padding)，Nav2 可能停不到正位",
                     mapController.getGlobalFootprintPadding()));
         }
-        if (cur != null && mapController.staticMapPolygonHasOccupied(footprintPoly(cur[0], cur[1], cur[2], 0))) {
-            // 不拦(车就停在这)，但这几乎必然让 Smac 从起点就动不了：多半是定位偏了或地图里有残影
-            log.warn("[导航目标] ⚠ 车当前位姿的车身就压着地图障碍，Smac 起步会失败。先检查定位(手动设初始位姿)或地图残影");
+        if (((Number) startDiagnostic.get("paddingCount")).intValue() > 0) {
+            if (note.length() > 0) note.append("；");
+            note.append("起点实车未压线，但安全余量内有障碍：").append(startDiagnostic.get("sideSummary"));
         }
-
-        abort("新目标覆盖");
-        hw.resetReverseTracker();
-        Mission m = new Mission(seq.incrementAndGet(), gx, gy, th, s, precise || s != 0);
-        mission = m;
+        Mission m;
+        synchronized (missionLock) {
+            if (preparationSequence.get() != preparationId) throw new IllegalArgumentException("目标检查已被取消或新请求覆盖");
+            abort("新目标覆盖");
+            // Only a validated new goal may release the existing Java emergency-stop lock.
+            if (hw.isEmergencyStopActive()) {
+                log.warn("[导航目标] 定位和静态地图检查通过，解除 Java 侧急停锁");
+                hw.clearEmergencyStopLock();
+            }
+            hw.resetReverseTracker();
+            m = new Mission(seq.incrementAndGet(), gx, gy, th, s, precise || s != 0);
+            m.poseSample = checked.sample;
+            mission = m;
+        }
         log.info("[任务#{}] 目标(雷达) ({}, {}) 朝向 {}°{}{}{} {}", m.id, fmt(gx), fmt(gy), fmt(Math.toDegrees(th)),
                 theta == null ? "(自动)" : "", s != 0 ? " 侧向对位 " + fmt(s) + "m" : "",
                 m.precise ? " 精确停车" : " 非固定(到附近即停)", note);
@@ -250,6 +305,9 @@ public class ManeuverService {
         r.put("y", gy);
         r.put("theta", th);
         r.put("note", note.toString());
+        r.put("missionId", m.id);
+        if (!((List<?>) startDiagnostic.get("hits")).isEmpty()) r.put("diagnostic", startDiagnostic);
+        else if (targetDiagnostic != null) r.put("diagnostic", targetDiagnostic);
         return r;
     }
 
@@ -299,12 +357,25 @@ public class ManeuverService {
         return null;
     }
 
+    public boolean isRunning() {
+        synchronized (missionLock) {
+            Mission m = mission;
+            return m != null && !m.aborted && !m.finished;
+        }
+    }
+
     /** 取消任务：正在做的机动会在下一拍(≤50ms)停车退出 */
     public void abort(String why) {
-        Mission m = mission;
-        if (m != null && !m.aborted) {
-            m.aborted = true;
-            log.info("[任务#{}] 中止: {}", m.id, why);
+        synchronized (missionLock) {
+            preparationSequence.incrementAndGet();
+            Mission m = mission;
+            if (m != null && !m.aborted) {
+                m.aborted = true;
+                m.waitingSinceNs = 0;
+                // 发布并缓存取消终态，刷新不能重新恢复最后一条 navigating/path。
+                status(m, "canceled", "任务已中止：" + why, true);
+                log.info("[任务#{}] 中止: {}", m.id, why);
+            }
         }
     }
 
@@ -323,6 +394,9 @@ public class ManeuverService {
                         rotateTo(m, m.gth, false);
                     }
                 }
+            } catch (LocalizationRefused e) {
+                status(m, "failed", e.getMessage(), false, e.data);
+                return;
             } catch (Refused e) {
                 status(m, "pre-rotate", "不原地转(" + e.getMessage() + ")，交给 Nav2 走弧线/倒车调头", true);
             } catch (Aborted e) {
@@ -334,21 +408,25 @@ public class ManeuverService {
             }
         }
         if (isStale(m)) return;
-        sendGoal(m);
+        try { sendGoal(m); }
+        catch (Exception e) { status(m, "failed", "发送 Nav2 目标失败: " + e.getMessage(), false); }
     }
 
     private void sendGoal(Mission m) {
-        // 侧向对位：Nav2 先去"终点往反方向挪 side"的预备位，到了再平移过去
-        double sx = m.gx + m.side * Math.sin(m.gth);
-        double sy = m.gy - m.side * Math.cos(m.gth);
-        final long sentMs = System.currentTimeMillis();
-        final long sentNs = sentMs * 1_000_000L;
-        m.waitingSinceNs = sentNs;
-        navigation.sendNavigationGoal(sx, sy, m.gth);
-        status(m, "navigating", m.side != 0
-                ? String.format("Nav2 前往预备位 (%.2f, %.2f)，到达后平移 %.2fm", sx, sy, m.side)
-                : "Nav2 导航中", true);
-        timer.schedule(() -> checkPlanTimeout(m, sentMs, sentNs), planTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        synchronized (m) {
+            if (isStale(m)) return;
+            // 侧向对位：Nav2 先去"终点往反方向挪 side"的预备位，到了再平移过去
+            double sx = m.gx + m.side * Math.sin(m.gth);
+            double sy = m.gy - m.side * Math.cos(m.gth);
+            final long sentMs = System.currentTimeMillis();
+            final long sentNs = sentMs * 1_000_000L;
+            m.waitingSinceNs = sentNs;
+            navigation.sendNavigationGoal(sx, sy, m.gth);
+            status(m, "navigating", m.side != 0
+                    ? String.format("Nav2 前往预备位 (%.2f, %.2f)，到达后平移 %.2fm", sx, sy, m.side)
+                    : "Nav2 导航中", true);
+            timer.schedule(() -> checkPlanTimeout(m, sentMs, sentNs), planTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
     }
 
     /** 发目标 planTimeoutMs 后仍没收到任何路径：取消 Nav2，诊断车身哪边被挡，能侧移就侧移后重发 */
@@ -359,13 +437,7 @@ public class ManeuverService {
         log.warn("[任务#{}] 发目标 {}s 仍没有路径，判定规划失败，已{}取消 Nav2 目标", m.id, planTimeoutMs / 1000,
                 cancelled ? "" : "尝试(调用未确认)");
         worker.submit(() -> {
-            diagnoseStartCollision(m);
-            if (enabled && corridorShift && !m.shiftTried) {
-                runShiftRetry(m);
-            } else {
-                status(m, "failed", String.format("Nav2 %ds 内规划不出路径%s", planTimeoutMs / 1000,
-                        m.shiftTried ? "(侧移后重试仍失败)" : ""), false);
-            }
+            handlePlanningFailure(m, "Nav2 " + planTimeoutMs / 1000 + "s 内未返回路径");
         });
     }
 
@@ -383,12 +455,7 @@ public class ManeuverService {
                 status(m, "done", "到达目标", true);
             }
         } else if (status == 6) {
-            diagnoseStartCollision(m);
-            if (enabled && corridorShift && !m.shiftTried) {
-                worker.submit(() -> runShiftRetry(m));
-            } else {
-                status(m, "failed", "Nav2 导航失败", false);
-            }
+            worker.submit(() -> handlePlanningFailure(m, "Nav2 返回导航失败"));
         } else {
             status(m, "canceled", "Nav2 目标已取消", false);
         }
@@ -405,6 +472,8 @@ public class ManeuverService {
                     rotateTo(m, m.gth, true);
                     sleep(m, settleMs);
                     p = freshMapPose(m, true);
+                } catch (LocalizationRefused e) {
+                    throw e;
                 } catch (Refused e) {
                     status(m, "align", "不做朝向对正: " + e.getMessage(), true);
                 }
@@ -423,6 +492,8 @@ public class ManeuverService {
                 lateralMove(m, ey);
             }
             status(m, "done", "到达并完成对位", true);
+        } catch (LocalizationRefused e) {
+            status(m, "failed", e.getMessage(), false, e.data);
         } catch (Refused e) {
             status(m, "done", "到达，对位未执行: " + e.getMessage(), m.side == 0);
         } catch (Aborted e) {
@@ -432,11 +503,10 @@ public class ManeuverService {
         }
     }
 
-    private void runShiftRetry(Mission m) {
+    private void runShiftRetry(Mission m, double[] p) {
         m.shiftTried = true;
         try {
-            sleep(m, settleMs);
-            double[] p = freshMapPose(m, true);
+            if (isStale(m)) return;
             double left  = sideClearance(p, true);
             double right = sideClearance(p, false);
             if (Math.min(left, right) >= corridorTightM) {
@@ -445,7 +515,7 @@ public class ManeuverService {
                 return;
             }
             if (Math.abs(left - right) < lateralTolM * 2) {
-                status(m, "failed", String.format("Nav2 导航失败；两侧净空 左%.2fm/右%.2fm 一样挤，往哪边移都没用", left, right), false);
+                status(m, "failed", String.format("Nav2 导航失败；两侧净空 左%.2fm/右%.2fm 接近，未找到更宽的侧移方向，本次不自动侧移", left, right), false);
                 return;
             }
             // 往空的一侧移，移到挤的那侧留出 外扩+0.15m 就够(不强行居中：空的那侧可能很远，没必要一口气移很多)
@@ -477,6 +547,8 @@ public class ManeuverService {
                     new JsonObject(), 2000);
             sleep(m, 1500);   // global_costmap 1Hz 刷新，等它按新位置重新标一遍
             sendGoal(m);
+        } catch (LocalizationRefused e) {
+            status(m, "failed", e.getMessage(), false, e.data);
         } catch (Refused e) {
             status(m, "failed", "Nav2 导航失败；侧移未执行: " + e.getMessage(), false);
         } catch (Aborted e) {
@@ -620,39 +692,150 @@ public class ManeuverService {
      */
     private double[] freshMapPose(Mission m, boolean requireFresh) throws Exception {
         if (requireFresh) {
-            // ⚠ 调一次不一定出位姿：AMCL 每 resample_interval(=3) 次滤波更新才重采样并发布 /amcl_pose，
-            //   只 nomotion 一次常常等不到(现场报"3s 内没有给出新位姿")。每 400ms 催一次，最多等 5s
-            long before = System.currentTimeMillis(), lastKick = 0;
-            while (bridge.getLastAmclPoseMs() <= before) {
-                checkAlive(m, before);
-                long now = System.currentTimeMillis();
-                if (now - before > 3000) {
-                    // 催不出新位姿时退回"上次 AMCL + 里程计推算"，别因为这个直接放弃机动
-                    if (bridge.getOdomPose(1500) == null) {
-                        // Java 这边收不到 ≠ fast_lio 挂了：更常见的是 rosbridge 订阅丢了(ROS2BridgeService 会自动重订阅)
-                        throw new Refused("Java 超过 1.5s 没收到 /Odometry。先在机器人上 ros2 topic hz /Odometry："
-                                + "有频率 = rosbridge 订阅丢了(几秒内会自动重订阅，稍后重试)；没频率 = fast_lio 没在跑");
-                    }
-                    double[] est = bridge.getEstimatedMapPose();
-                    if (est == null) {
-                        throw new Refused("AMCL 没有给出新位姿，且没有可推算的历史位姿(先设置初始点位)");
-                    }
-                    log.info("[任务#{}] AMCL 3s 没出新位姿(fast_lio 正常)，用 上次AMCL+里程计 推算位姿 ({}, {}, {}°)",
-                            m.id, fmt(est[0]), fmt(est[1]), fmt(Math.toDegrees(est[2])));
-                    return est;
-                }
-                if (now - lastKick >= 400) {
-                    bridge.callService("/request_nomotion_update", "std_srvs/srv/Empty", new JsonObject(), 1000);
-                    lastKick = System.currentTimeMillis();
-                }
-                Thread.sleep(50);
-            }
+            StablePose checked = awaitStablePose(m, 0);
+            m.poseSample = checked.sample;
+            return checked.pose;
         }
-        // 优先用"AMCL + 里程计推算"：车停着时 AMCL 缓存可能是停车前 0.25m 处的旧值
-        double[] est = bridge.getEstimatedMapPose();
-        double[] p = est != null ? est : bridge.getLastAmclPose();
-        if (p == null) throw new Refused("还没有 AMCL 位姿");
+        double[] p = bridge.getEstimatedMapPose();
+        if (p == null) throw new Refused("没有可用的定位和新鲜里程计，本次机动未执行");
         return p;
+    }
+
+    private StablePose awaitStablePose(Mission m, long preparationId) throws Refused, InterruptedException {
+        long started = System.currentTimeMillis();
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(localizationCheckTimeoutMs);
+        long lastKick = 0;
+        int stable = 0;
+        ROS2BridgeService.AmclSample previous = bridge.getAmclSample();
+        ROS2BridgeService.AmclSample settleOrigin=previous;
+        while (System.nanoTime() < deadline) {
+            if (m != null && isStale(m)) throw new Aborted("任务已中止");
+            if (m == null && preparationSequence.get() != preparationId) throw new IllegalArgumentException("定位检查已取消");
+            previous=bridge.refreshAmclSample(previous);
+            if(settleOrigin.odomReference==null) settleOrigin=previous;
+            for(ROS2BridgeService.AmclSample current:bridge.getAmclSamplesAfter(previous.sequence)) {
+                if(current.receivedAtMs<started){previous=current;continue;}
+                if(current.odomReference==null) break; // Do not overwrite a pending observation with a newer one.
+                double[] correction=NavigationGeometry.correction(previous.pose,previous.odomReference,current.pose,current.odomReference);
+                double[] cumulative=NavigationGeometry.correction(settleOrigin.pose,settleOrigin.odomReference,current.pose,current.odomReference);
+                if(m==null && cumulative!=null && (cumulative[0]>localizationSettleMaxCorrectionM || cumulative[1]>Math.toRadians(localizationSettleMaxCorrectionDeg)))
+                    throw localizationJump(settleOrigin,current,cumulative,m==null ? "目标预检查" : "机动前检查");
+                if(correction!=null && correctionTooLarge(correction)) {
+                    boolean stationary=previous.odomReference!=null &&
+                            Math.hypot(current.odomReference[0]-previous.odomReference[0],current.odomReference[1]-previous.odomReference[1])<=0.02 &&
+                            Math.abs(NavigationGeometry.wrap(current.odomReference[2]-previous.odomReference[2]))<=Math.toRadians(0.5);
+                    if(m==null && stationary && correction[0]<=localizationSettleMaxCorrectionM &&
+                            correction[1]<=Math.toRadians(localizationSettleMaxCorrectionDeg)) {
+                        log.info("[定位预检查] 尚未发目标，静止时定位修正 {}m/{}deg，重新等待连续稳定更新",fmt(correction[0]),fmt(Math.toDegrees(correction[1])));
+                        stable=0;previous=current;continue;
+                    }
+                    throw localizationJump(previous,current,correction,m==null ? "目标预检查" : "机动前检查");
+                }
+                stable=correction==null ? 0 : stable+1;
+                previous=current;
+                if(stable>=Math.max(2,localizationStableUpdates)) {
+                    double[] now=NavigationGeometry.predict(current.pose,current.odomReference,bridge.getOdomPose(1500));
+                    if(now==null) throw new LocalizationRefused("定位检查失败：没有新鲜里程计，无法确认定位稳定，本次未执行",localizationErrorData());
+                    log.info("[定位稳定检查] 新更新={} 位姿=({}, {}, {}deg)",stable,fmt(now[0]),fmt(now[1]),fmt(Math.toDegrees(now[2])));
+                    return new StablePose(now,current);
+                }
+            }
+            if (System.currentTimeMillis() - lastKick >= 400) {
+                bridge.callService("/request_nomotion_update", "std_srvs/srv/Empty", new JsonObject(), 1000);
+                lastKick = System.currentTimeMillis();
+            }
+            Thread.sleep(50);
+        }
+        Map<String,Object> data=localizationErrorData();
+        data.put("timing",bridge.localizationTiming(null));
+        log.warn("[定位时间对齐] 预检查超时 timing={}",data.get("timing"));
+        throw new LocalizationRefused("定位检查超时：未获得连续稳定的新 AMCL 位姿及对应里程计；时间诊断已记录到 Java 日志",data);
+    }
+
+    private boolean correctionTooLarge(double[] correction) {
+        return correction[0] > localizationMaxCorrectionM || correction[1] > Math.toRadians(localizationMaxCorrectionDeg);
+    }
+
+    private Map<String, Object> localizationErrorData() {
+        Map<String, Object> d = new java.util.LinkedHashMap<>();
+        d.put("code", "LOCALIZATION_UNSTABLE"); d.put("clearDiagnostic", true);
+        return d;
+    }
+
+    private LocalizationRefused localizationJump(ROS2BridgeService.AmclSample previous, ROS2BridgeService.AmclSample current, double[] correction) {
+        return localizationJump(previous,current,correction,"导航运行检查");
+    }
+    private LocalizationRefused localizationJump(ROS2BridgeService.AmclSample previous, ROS2BridgeService.AmclSample current, double[] correction,String stage) {
+        Map<String, Object> d = localizationErrorData();
+        d.put("stage",stage);d.put("previousOdom",previous.odomReference);d.put("currentOdom",current.odomReference);
+        d.put("previousRosStampNs",previous.rosStampNs);d.put("currentRosStampNs",current.rosStampNs);
+        d.put("previousPose", previous.pose); d.put("currentPose", current.pose);
+        d.put("timing",bridge.localizationTiming(current));
+        d.put("correctionM", correction[0]); d.put("correctionDeg", Math.toDegrees(correction[1]));
+        log.warn("[定位修正超限] stage={} previousMap={} currentMap={} previousOdom={} currentOdom={} correctionM={} correctionDeg={} timing={}",
+                stage,java.util.Arrays.toString(previous.pose),java.util.Arrays.toString(current.pose),java.util.Arrays.toString(previous.odomReference),
+                java.util.Arrays.toString(current.odomReference),correction[0],Math.toDegrees(correction[1]),d.get("timing"));
+        return new LocalizationRefused(String.format("定位发生跳变：扣除里程计运动后偏移 %.2fm、朝向 %.1f°；停止本次任务及自动侧移；请核对定位，稳定后重试上次目标；明显偏离实际车位时再重设初始位姿",
+                correction[0], Math.toDegrees(correction[1])), d);
+    }
+
+    private LocalizationRefused alignmentFailure(ROS2BridgeService.AmclSample sample,String reason) {
+        Map<String,Object> data=localizationErrorData();
+        data.put("code","LOCALIZATION_TIME_UNALIGNED");
+        Map<String,Object> timing=bridge.localizationTiming(sample);data.put("timing",timing);
+        log.warn("[定位时间对齐失败] reason={} timing={}",reason,timing);
+        Object odomValue=timing.get("odom");
+        Map<?,?> odom=odomValue instanceof Map ? (Map<?,?>)odomValue : java.util.Collections.emptyMap();
+        String code=String.valueOf(odom.get("reason"));
+        String detail="AFTER_LATEST".equals(code) ? "定位时间晚于已收到的里程计" :
+                "BEFORE_HISTORY".equals(code) ? "定位时间早于里程计历史窗口" :
+                "ODOM_GAP_TOO_LARGE".equals(code) ? "里程计采样间隔过大" :
+                "MISSING_AMCL_STAMP".equals(code) ? "定位消息缺少时间戳" :
+                "NO_ODOMETRY".equals(code) ? "未收到有时间戳的里程计" : code;
+        if(odom.get("bracketGapMs") instanceof Number) detail+=String.format("，间隔%.1fms",((Number)odom.get("bracketGapMs")).doubleValue());
+        if(odom.get("amclMinusLatestMs") instanceof Number) detail+=String.format("，定位比最新里程计%+.1fms",((Number)odom.get("amclMinusLatestMs")).doubleValue());
+        return new LocalizationRefused(reason+"；"+detail+"。时间诊断已写入 Java 日志，请保留日志和 timing.json",data);
+    }
+
+    private void monitorLocalization() {
+        Mission m = mission;
+        if (m == null || m.finished || isStale(m) || m.poseSample == null) return;
+        try {
+            LocalizationRefused failure=null;
+            synchronized(m) {
+                ROS2BridgeService.AmclSample previous=bridge.refreshAmclSample(m.poseSample);
+                for(ROS2BridgeService.AmclSample current:bridge.getAmclSamplesAfter(previous.sequence)) {
+                    if(current.sequence>previous.sequence+1) {
+                        failure=alignmentFailure(current,"AMCL样本历史缺失，无法检查中间定位修正");break;
+                    }
+                    double[] correction=NavigationGeometry.correction(previous.pose,previous.odomReference,current.pose,current.odomReference);
+                    if(correction==null) {
+                        if(m.unmatchedSinceMs==0)m.unmatchedSinceMs=System.currentTimeMillis();
+                        if(System.currentTimeMillis()-m.unmatchedSinceMs>=1500) failure=alignmentFailure(current,"定位与里程计时间无法对齐，已停止任务");
+                        break;
+                    }
+                    m.unmatchedSinceMs=0;
+                    m.poseSample=current;
+                    if(correctionTooLarge(correction)){failure=localizationJump(previous,current,correction);break;}
+                    previous=current;
+                }
+                if(System.currentTimeMillis()-m.lastTimingLogMs>=5000) {
+                    m.lastTimingLogMs=System.currentTimeMillis();
+                    log.info("[定位时间对齐] task={} checkedSequence={} timing={}",m.id,m.poseSample.sequence,bridge.localizationTiming(null));
+                }
+                if(failure!=null){m.aborted=true;m.waitingSinceNs=0;}
+            }
+            if (failure != null) {
+                synchronized (missionLock) {
+                    if (mission != m || m.finished) return;
+                    try { hw.emergencyStop(); }
+                    finally {
+                        status(m, "failed", failure.getMessage(), false, failure.data);
+                        bridge.cancelAllNavGoals();
+                    }
+                }
+            }
+        } catch (Exception e) { log.error("[定位监测失败] task={}", m.id, e); }
     }
 
     /** 车身某一侧(沿整车长度取前/中/后三处)到障碍的净空：点云与静态地图取小 */
@@ -692,30 +875,81 @@ public class ManeuverService {
     }
 
     private boolean isStale(Mission m) {
-        return m.aborted || mission != m;
+        return m.aborted || m.finished || mission != m;
     }
 
     /**
      * Nav2 失败时查一下"车现在停的地方车身(含外扩)压没压静态地图障碍"。
      * Nav2 报 `Starting point in lethal space` 时起点就规划不出来，controller 一条速度都不会发，
      * 前端只会说"0 条控制指令、查 TF"，完全看不出是车身贴着东西。这里把压到的格子推给前端画在车身上。
-     * 静态地图不压 → 说明是雷达实时看到的东西贴着车身(料堆/人/车体自身点没滤干净)。
+     * 静态地图未命中时不能归因；实时障碍、目标可达性和规划器日志仍需核对。
      */
-    private void diagnoseStartCollision(Mission m) {
-        double[] est = bridge.getEstimatedMapPose();
-        double[] p = est != null ? est : bridge.getLastAmclPose();
-        if (p == null) return;
-        double pad = mapController.getGlobalFootprintPadding();
-        List<double[]> hits = mapController.staticMapOccupiedPoints(footprintPoly(p[0], p[1], p[2], pad), 400);
-        if (hits.isEmpty()) {
-            log.info("[任务#{}] 失败诊断: 起点车身(外扩 {}m)不压静态地图。若 planner 报 Starting point in lethal space，"
-                    + "是实时点云障碍贴着车身，看车周围 {}m 内有没有东西", m.id, pad, pad);
-            return;
+    private void handlePlanningFailure(Mission m, String reason) {
+        if (isStale(m)) return;
+        try {
+            status(m, "checking", reason + "，正在刷新定位并检查压线位置", true);
+            sleep(m, settleMs);
+            StablePose checked = awaitStablePose(m, 0);
+            m.poseSample = checked.sample;
+            if (isStale(m)) return;
+            Map<String, Object> diagnostic = collisionData(checked.pose, mapController.getGlobalFootprintPadding(), "start");
+            int body = ((Number) diagnostic.get("bodyCount")).intValue();
+            int padding = ((Number) diagnostic.get("paddingCount")).intValue();
+            String detail = body > 0 ? "刷新定位后，起点实车轮廓与静态地图障碍相交：" + diagnostic.get("sideSummary")
+                    : padding > 0 ? "起点实车未压线，仅安全余量内有障碍：" + diagnostic.get("sideSummary")
+                    : "刷新定位后，起点实车和安全余量均未压静态地图；需检查 Nav2 规划日志、实时障碍和目标可达性";
+            log.info("[任务#{}] 压线诊断 | 位姿={} 实车={} 仅余量={} 外扩={}m", m.id,
+                    java.util.Arrays.toString(checked.pose), body, padding, mapController.getGlobalFootprintPadding());
+            status(m, "diagnostic", detail, body == 0 && padding == 0, diagnostic);
+            if (body > 0) {
+                status(m, "failed", reason + "；" + detail + "。本次不执行自动机动，请核对定位和地图", false, diagnostic);
+            } else if (enabled && corridorShift && !m.shiftTried) {
+                runShiftRetry(m, checked.pose);
+            } else {
+                status(m, "failed", reason + "；" + detail, false, diagnostic);
+            }
+        } catch (LocalizationRefused e) {
+            status(m, "failed", e.getMessage(), false, e.data);
+        } catch (Aborted e) {
+            // A newer goal or user cancellation owns the UI and control now.
+        } catch (Exception e) {
+            status(m, "failed", reason + "；检查未完成: " + e.getMessage(), false);
         }
-        Map<String, Object> extra = new java.util.LinkedHashMap<>();
-        extra.put("x", p[0]); extra.put("y", p[1]); extra.put("theta", p[2]); extra.put("hits", hits);
-        status(m, "failed", String.format("车当前位置车身(含外扩 %.2fm)压着地图障碍 %d 格(红点)，Nav2 从起点就规划不出来。"
-                + "可能是定位偏了(重设初始点位)、车真的贴着障碍(手动挪开)，或地图残影(擦除地图)", pad, hits.size()), false, extra);
+    }
+
+    private Map<String, Object> collisionData(double[] p, double pad, String kind) {
+        double resolution = mapController.getStaticMapResolution();
+        double[][] bodyPoly = footprintPoly(p[0], p[1], p[2], 0);
+        double[][] paddedPoly = footprintPoly(p[0], p[1], p[2], pad);
+        List<double[]> bodyHits = mapController.staticMapOccupiedPoints(bodyPoly, 400);
+        List<double[]> hits = mapController.staticMapOccupiedPoints(paddedPoly, 400);
+        List<double[]> paddingHits = new java.util.ArrayList<>();
+        for (double[] h : hits) if (!NavigationGeometry.cellIntersects(bodyPoly, h[0], h[1], resolution)) paddingHits.add(h);
+        Map<String, Integer> sides = new java.util.LinkedHashMap<>();
+        for (String side : new String[]{"车头", "车尾", "左侧", "右侧"}) sides.put(side, 0);
+        for (double[] h : bodyHits.isEmpty() ? paddingHits : bodyHits) {
+            double dx = h[0] - p[0], dy = h[1] - p[1], c = Math.cos(p[2]), s = Math.sin(p[2]);
+            double x = c * dx + s * dy, y = -s * dx + c * dy;
+            double[] distances = {Math.abs(x - FOOTPRINT_FRONT_M), Math.abs(x - FOOTPRINT_BACK_M),
+                    Math.abs(y - FOOTPRINT_LEFT_M), Math.abs(y + FOOTPRINT_RIGHT_M)};
+            int nearest = 0;
+            for (int i = 1; i < 4; i++) if (distances[i] < distances[nearest]) nearest = i;
+            String side = new String[]{"车头", "车尾", "左侧", "右侧"}[nearest];
+            sides.put(side, sides.get(side) + 1);
+        }
+        StringBuilder summary = new StringBuilder();
+        for (Map.Entry<String, Integer> entry : sides.entrySet()) if (entry.getValue() > 0) {
+            if (summary.length() > 0) summary.append("、");
+            summary.append(entry.getKey()).append(entry.getValue()).append("格");
+        }
+        Map<String, Object> d = new java.util.LinkedHashMap<>();
+        d.put("kind", kind); d.put("x", p[0]); d.put("y", p[1]); d.put("theta", p[2]);
+        d.put("padding", pad); d.put("resolution", resolution); d.put("footprint", paddedPoly); d.put("bodyFootprint", bodyPoly);
+        d.put("hits", hits); d.put("bodyHits", bodyHits); d.put("paddingHits", paddingHits);
+        d.put("bodyCount", bodyHits.size()); d.put("paddingCount", paddingHits.size()); d.put("sides", sides);
+        d.put("sideSummary", summary.length() > 0 ? summary.toString() : "无静态地图命中");
+        d.put("checkedAtMs", System.currentTimeMillis()); d.put("capped", hits.size() >= 400 || bodyHits.size() >= 400);
+        return d;
     }
 
     private void status(Mission m, String phase, String msg, boolean ok) {
@@ -723,15 +957,25 @@ public class ManeuverService {
     }
 
     private void status(Mission m, String phase, String msg, boolean ok, Map<String, Object> extra) {
-        if (ok) log.info("[任务#{}] {} | {}", m.id, phase, msg);
-        else    log.warn("[任务#{}] {} | {}", m.id, phase, msg);
-        JSONObject d = new JSONObject();
-        if (extra != null) d.putAll(extra);
-        d.put("missionId", m.id);
-        d.put("phase", phase);
-        d.put("message", msg);
-        d.put("ok", ok);
-        push.pushToAll("maneuver_status", d);
+        synchronized (missionLock) {
+            if (mission != m || m.finished) return;
+            if ("failed".equals(phase) || "done".equals(phase) || "canceled".equals(phase)) {
+                m.finished = true; m.waitingSinceNs = 0;
+            }
+            if (ok) log.info("[任务#{}] {} | {}", m.id, phase, msg);
+            else    log.warn("[任务#{}] {} | {}", m.id, phase, msg);
+            JSONObject d = new JSONObject();
+            if (extra != null) d.putAll(extra);
+            d.put("missionId", m.id);
+            d.put("startedAtMs", m.startedAtMs);
+            d.put("goal", new double[]{m.gx, m.gy, m.gth});
+            d.put("sideApproachM",m.side);
+            d.put("precise",m.precise);
+            d.put("phase", phase);
+            d.put("message", msg);
+            d.put("ok", ok);
+            push.pushToAll("maneuver_status", d);
+        }
     }
 
     private static double wrap(double a) {

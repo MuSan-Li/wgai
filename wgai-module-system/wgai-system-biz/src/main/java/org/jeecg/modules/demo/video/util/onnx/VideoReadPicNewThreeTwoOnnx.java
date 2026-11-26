@@ -116,6 +116,7 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
         try {
             org.opencv.core.Core.setNumThreads(2); // 限制OpenCV使用2个线程
         } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.warn("[设置OpenCV线程数失败]", e);
         }
     }
@@ -283,9 +284,11 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
             }
 
         } catch (OutOfMemoryError oom) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(oom);
             log.error("[严重内存溢出] 流: {}, 执行紧急清理", tabAiSubscriptionNew.getName(), oom);
             performEmergencyCleanup();
         } catch (Exception exception) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(exception);
             log.error("[处理异常] 流: {}", tabAiSubscriptionNew.getName(), exception);
         } finally {
             log.info("[开始清理资源] 流: {}", tabAiSubscriptionNew.getName());
@@ -413,6 +416,7 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
         try {
             frameClone = frame.clone();
         } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[Frame克隆失败] 流: {}, 错误: {}", tabAiSubscriptionNew.getName(), e.getMessage());
 
             return;
@@ -424,6 +428,7 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
         // 提交到全局共享线程池 - 关键优化点
         Future<?> future = processingExecutor.submit(() -> {
             long startTime = System.currentTimeMillis();
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.begin(tabAiSubscriptionNew);
             Java2DFrameConverter converter = null;
             BufferedImage image = null;
             Mat matInfo = null;
@@ -464,6 +469,7 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
                         return;
                     }
                 } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
                     log.error("[图像转换异常] 流: {}", tabAiSubscriptionNew.getName(), e);
                     return;
                 }
@@ -495,6 +501,7 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
                 }
 
                 processedFrames.incrementAndGet();
+                org.jeecg.modules.demo.video.util.SubscriptionHeartbeatState.completed(tabAiSubscriptionNew);
                 GLOBAL_PROCESSED_FRAMES.incrementAndGet();
                 lastProcessTime = System.currentTimeMillis();
 
@@ -505,11 +512,14 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
                 }
 
             } catch (OutOfMemoryError oom) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(oom);
                 log.error("[帧处理内存溢出] 流: {}", tabAiSubscriptionNew.getName(), oom);
                 performEmergencyCleanup();
             } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
                 log.error("[帧处理异常] 流: {}", tabAiSubscriptionNew.getName(), e);
             } finally {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.clear();
                 // 快速资源清理
                 if (matInfo != null) {
                     returnMatToPool(matInfo);
@@ -545,6 +555,7 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
         try {
             return new Java2DFrameConverter();
         } catch (OutOfMemoryError e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[转换器创建内存不足] 流: {}", tabAiSubscriptionNew.getName());
             return null;
         }
@@ -579,6 +590,7 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
         try {
             return new Mat();
         } catch (OutOfMemoryError e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[Mat创建内存不足] 流: {}", tabAiSubscriptionNew.getName());
             return null;
         }
@@ -622,6 +634,7 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
             }
 
         } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[处理NetPush异常] 流: {}, 模型: {}",
                     tabAiSubscriptionNew.getName(),
                     netPush.getTabAiModel() != null ? netPush.getTabAiModel().getAiName() : "unknown", e);
@@ -656,6 +669,7 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
             }
 
         } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[执行检测异常] 流: {}, 模型类型: {}", tabAiSubscriptionNew.getName(), netPush.getModelType(), e);
         }
     }
@@ -697,6 +711,7 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
                     tabAiSubscriptionNew, mat, beforePush,redisTemplate);
 
         } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[验证模型异常] 流: {}", tabAiSubscriptionNew.getName(), e);
             return null;
         }
@@ -865,6 +880,7 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
         try {
             return RedisCacheHolder.get(tabAiSubscriptionNew.getId() + "newRunPush");
         } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.warn("[检查流状态异常] 流: {}", tabAiSubscriptionNew.getName(), e);
             return false;
         }
@@ -979,6 +995,7 @@ public class VideoReadPicNewThreeTwoOnnx implements Runnable {
             // 清理原有的ThreadLocal
             threadLocalNetCache.remove();
         } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.warn("[ThreadLocal清理异常] 流: {}", tabAiSubscriptionNew.getName(), e);
         }
 

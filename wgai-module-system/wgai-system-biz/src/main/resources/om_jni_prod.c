@@ -21,6 +21,20 @@ static void thr(JNIEnv *e, const char *m) {
     if (c) (*e)->ThrowNew(e, c, m);
 }
 
+JNIEXPORT jlongArray JNICALL Java_org_jeecg_modules_ai_ascend_AscendOmSession_nativeInputShape(JNIEnv *e, jclass c, jlong h) {
+    Om *m = (Om *)(intptr_t)h;
+    if (!m || m->nIn != 1) { thr(e, "Only single-input static-batch OM models are supported"); return NULL; }
+    aclmdlIODims dims;
+    if (aclmdlGetInputDims(m->desc, 0, &dims) != ACL_SUCCESS) { thr(e, "aclmdlGetInputDims"); return NULL; }
+    jlongArray result = (*e)->NewLongArray(e, (jsize)dims.dimCount);
+    if (!result) return NULL;
+    jlong *values = (*e)->GetLongArrayElements(e, result, NULL);
+    if (!values) return NULL;
+    for (size_t i = 0; i < dims.dimCount; i++) values[i] = (jlong)dims.dims[i];
+    (*e)->ReleaseLongArrayElements(e, result, values, 0);
+    return result;
+}
+
 JNIEXPORT jint JNICALL Java_org_jeecg_modules_ai_ascend_AscendOmSession_nativeInit(JNIEnv *e, jclass c, jint dev) {
     if (dev < 0 || dev >= MAX_DEV) { LOGE("device %d out of range", dev); return -1; }
     if (g_ctxOk[dev]) return 0;

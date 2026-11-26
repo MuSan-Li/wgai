@@ -68,12 +68,14 @@ public class ROS2WebSocketHandler extends TextWebSocketHandler {
     private final Runnable onDisconnectCallback;
     private final Consumer<JsonObject> onServiceResponseCallback;
     /** 每次收到 /amcl_pose 时回调，用于更新 ROS2BridgeService 的位姿缓存 */
-    private final Consumer<JsonObject> onAmclPoseCallback;
+    private final java.util.function.Predicate<JsonObject> onAmclPoseCallback;
     /** supportsPartialMessages()=true,大消息会分片到达,拼到 isLast 再解析 */
     private final StringBuilder partialBuf = new StringBuilder();
 
     // 点云下采样:最多推送给前端的点数
     private static final int MAX_POINTS_TO_PUSH = 3000;
+    private volatile boolean fullResolutionPreview;
+    public void setFullResolutionPreview(boolean full) { this.fullResolutionPreview = full; }
 
     // 点云接收日志节流:每隔多久打印一次"收到点云"心跳日志,避免刷屏
     private static final long POINT_CLOUD_LOG_INTERVAL_MS = 5000;
@@ -133,6 +135,10 @@ public class ROS2WebSocketHandler extends TextWebSocketHandler {
     private volatile boolean lastObstacleOverridePushed = false;
     private volatile long   cachedOdomMs    = 0L;
 
+    private final org.jeecg.modules.ros2.service.OdomPoseHistory odomHistory = new org.jeecg.modules.ros2.service.OdomPoseHistory();
+    public double[] getOdomPoseAt(long stampNs) { return odomHistory.at(stampNs); }
+    public java.util.Map<String,Object> getOdomTiming(long stampNs) { return odomHistory.describe(stampNs); }
+
     /** 最近一次 /Odometry 位姿 [x, y, theta, 收到时刻ms]，没收到过返回 null。机动闭环(原地转/平移)靠它 */
     public double[] getOdomPose() {
         if (!hasOdomPose) return null;
@@ -166,7 +172,7 @@ public class ROS2WebSocketHandler extends TextWebSocketHandler {
             Consumer<WebSocketSession> onConnectCallback,
             Runnable onDisconnectCallback,
             Consumer<JsonObject> onServiceResponseCallback,
-            Consumer<JsonObject> onAmclPoseCallback) {
+            java.util.function.Predicate<JsonObject> onAmclPoseCallback) {
         this.velocityService           = velocityService;
         this.pushService               = pushService;
         this.hardwareService           = hardwareService;
@@ -281,7 +287,8 @@ public class ROS2WebSocketHandler extends TextWebSocketHandler {
             byte[] rawData    = Base64.getDecoder().decode(dataBase64);
 
             int totalPoints = rawData.length / pointStep;
-            int step = Math.max(1, totalPoints / MAX_POINTS_TO_PUSH);
+            final boolean fullPreview = fullResolutionPreview && !navMode;
+            int step = fullPreview ? 1 : Math.max(1, totalPoints / MAX_POINTS_TO_PUSH);
 
             int xOffset = 0, yOffset = 4, zOffset = 8;
             if (msg.has("fields")) {
@@ -386,7 +393,7 @@ public class ROS2WebSocketHandler extends TextWebSocketHandler {
                 if (Float.isNaN(x) || Float.isNaN(y) || Float.isInfinite(x) || Float.isInfinite(y)
                         || Float.isNaN(z) || Float.isInfinite(z))
                     continue;
-                if (z < pushZMin || z > pushZMax) continue;
+                if (!fullPreview && (z < pushZMin || z > pushZMax)) continue;
 
                 points.add(Math.round(x * 100.0) / 100.0);
                 points.add(Math.round(y * 100.0) / 100.0);
@@ -402,6 +409,7 @@ public class ROS2WebSocketHandler extends TextWebSocketHandler {
             cloudData.put("p",         points);   // 扁平 [x,y,z,...]，前端 utreeMap.handleCloud 还原
             cloudData.put("totalRaw",  totalPoints);
             cloudData.put("pushCount", points.size() / 3);
+            cloudData.put("fullResolution", fullPreview);
 
             // 心跳日志:每隔 POINT_CLOUD_LOG_INTERVAL_MS 打一行,确认点云在正常传输,不刷屏
             long now = System.currentTimeMillis();
@@ -450,6 +458,12 @@ public class ROS2WebSocketHandler extends TextWebSocketHandler {
             double posX = position.get("x").getAsDouble();
             double posY = position.get("y").getAsDouble();
             double theta = quaternionToYaw(orientation);
+            if (!org.jeecg.modules.ros2.service.NavigationGeometry.finitePose(new double[]{posX,posY,theta})) return;
+            if (msg.has("header") && msg.getAsJsonObject("header").has("stamp")) {
+                JsonObject stamp=msg.getAsJsonObject("header").getAsJsonObject("stamp");
+                long ns=stamp.get("sec").getAsLong()*1_000_000_000L+stamp.get("nanosec").getAsLong();
+                odomHistory.add(ns,new double[]{posX,posY,theta});
+            }
 
             // 0) 始终缓存位姿(旋转安全判定要用,必须在下面 navMode return 之前)
             cachedOdomX     = posX;
@@ -513,6 +527,9 @@ public class ROS2WebSocketHandler extends TextWebSocketHandler {
             double posY  = position.get("y").getAsDouble();
             double theta = quaternionToYaw(ori);
 
+            // Use exactly the samples accepted by the backend; old/invalid frames must not move the blue footprint.
+            if (onAmclPoseCallback != null && !onAmclPoseCallback.test(msg)) return;
+            if (!Double.isFinite(posX) || !Double.isFinite(posY) || !Double.isFinite(theta)) return;
             JSONObject poseData = new JSONObject();
             poseData.put("x",          posX);
             poseData.put("y",          posY);
@@ -525,7 +542,7 @@ public class ROS2WebSocketHandler extends TextWebSocketHandler {
 
             // ★ 更新 ROS2BridgeService 位姿缓存，供 MapController 位姿自动保存使用
             //   （替代原来每5s fork ros2 topic echo 的 shell 命令）
-            if (onAmclPoseCallback != null) onAmclPoseCallback.accept(msg);
+            // Cache acceptance was checked before publishing the same pose to the frontend.
 
             log.warn("AMCL位姿: x={}, y={}, θ={}°", posX, posY, (int) Math.toDegrees(theta));
 

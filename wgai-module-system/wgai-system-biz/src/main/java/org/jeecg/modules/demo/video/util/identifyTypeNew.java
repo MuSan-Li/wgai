@@ -118,6 +118,7 @@ public class identifyTypeNew {
             List<Mat> result = new ArrayList<>();
             List<String> outBlobNames = net.getUnconnectedOutLayersNames();
             net.forward(result, outBlobNames);
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
             result.forEach(nativeMats::keep);
 
             // 处理检测结果
@@ -205,6 +206,7 @@ public class identifyTypeNew {
             }
 
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
 
             return retureBoxInfo;
         }
@@ -239,6 +241,7 @@ public class identifyTypeNew {
             List<Mat> result = new ArrayList<>();
             List<String> outBlobNames = net.getUnconnectedOutLayersNames();
             net.forward(result, outBlobNames);
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
 
             // 处理检测结果
             float confThreshold = 0.35f;
@@ -387,6 +390,7 @@ public class identifyTypeNew {
                 picXmls.add(picXml);
             }
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             return picXmls;
         }
         return picXmls;
@@ -427,6 +431,7 @@ public class identifyTypeNew {
             List<Mat> result = new ArrayList<>();
             List<String> outBlobNames = net.getUnconnectedOutLayersNames();
             net.forward(result, outBlobNames);
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
             result.forEach(nativeMats::keep);
 
             // 处理检测结果
@@ -580,6 +585,7 @@ public class identifyTypeNew {
             returnBox.setInfoList(list);
 
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             return returnBox;
         }finally {
             if(returnBox.isFlag()==false){
@@ -610,6 +616,7 @@ public class identifyTypeNew {
         List<Mat> result = new ArrayList<>();
         List<String> outBlobNames = net.getUnconnectedOutLayersNames();
         net.forward(result, outBlobNames);
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
             result.forEach(nativeMats::keep);
 
         // 处理检测结果
@@ -732,6 +739,7 @@ public class identifyTypeNew {
 
 
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             log.info("连接失败");
             return false;
 
@@ -769,6 +777,7 @@ public class identifyTypeNew {
         List<Mat> result = new ArrayList<>();
         List<String> outBlobNames = net.getUnconnectedOutLayersNames();
         net.forward(result, outBlobNames);
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
 
         // 处理检测结果
         float confThreshold = 0.45f;
@@ -1102,6 +1111,7 @@ public class identifyTypeNew {
 
 
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             ex.printStackTrace();
             log.info("连接失败");
             return false;
@@ -1173,6 +1183,7 @@ public class identifyTypeNew {
             List<Mat> result = new ArrayList<>();
             List<String> outBlobNames = net.getUnconnectedOutLayersNames();
             net.forward(result, outBlobNames);
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
 
             // ========== 4. 计算ROI的letterbox参数(用于坐标还原) ==========
             double roiScale = Math.min(640.0 / roiImage.cols(), 640.0 / roiImage.rows());
@@ -1473,6 +1484,7 @@ public class identifyTypeNew {
             return true;
 
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             ex.printStackTrace();
             log.error("推送失败: {}", ex.getMessage());
             return false;
@@ -1512,6 +1524,7 @@ public class identifyTypeNew {
         List<Mat> result = new ArrayList<>();
         List<String> outBlobNames = net.getUnconnectedOutLayersNames();
         net.forward(result, outBlobNames);
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
             result.forEach(nativeMats::keep);
 
         // 处理检测结果
@@ -1786,6 +1799,7 @@ public class identifyTypeNew {
 
 
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             ex.printStackTrace();
             log.info("连接失败");
             return false;
@@ -1832,6 +1846,7 @@ public class identifyTypeNew {
         List<Mat> result = new ArrayList<>();
         List<String> outBlobNames = net.getUnconnectedOutLayersNames();
         net.forward(result, outBlobNames);
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
             result.forEach(nativeMats::keep);
 
         // 处理检测结果
@@ -2122,6 +2137,7 @@ public class identifyTypeNew {
 
 
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             ex.printStackTrace();
             log.info("连接失败");
             return false;
@@ -2217,6 +2233,7 @@ public class identifyTypeNew {
 
             List<Mat> outputs = new ArrayList<>();
             net.forward(outputs, net.getUnconnectedOutLayersNames());
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
 
             // 5. 解析检测结果
             List<Rect2d> boxes = new ArrayList<>();
@@ -2316,10 +2333,12 @@ public class identifyTypeNew {
                                     try {
                                         Files.deleteIfExists(path);
                                     } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
                                         e.printStackTrace();
                                     }
                                 });
                     } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
                         ex.printStackTrace();
                     }
                 }).start();
@@ -2330,6 +2349,7 @@ public class identifyTypeNew {
             Imgcodecs.imwrite(filename, roiMat);
             log.info("ROI[{}]已保存至: {}", roiIndex, filename);
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             log.error("保存ROI失败", ex);
         }
     }
@@ -2608,6 +2628,7 @@ public class identifyTypeNew {
             return false;
 
         } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("解析 shapeData 失败", e);
             return false;
         }
@@ -2762,10 +2783,12 @@ public class identifyTypeNew {
                                     try {
                                         Files.deleteIfExists(path);
                                     } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
                                         e.printStackTrace();
                                     }
                                 });
                     } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
                         ex.printStackTrace();
                     }
                 }).start();
@@ -2799,10 +2822,12 @@ public class identifyTypeNew {
                                     try {
                                         Files.deleteIfExists(path);
                                     } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
                                         e.printStackTrace();
                                     }
                                 });
                     } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
                         ex.printStackTrace();
                     }
                 }).start();
@@ -2836,10 +2861,12 @@ public class identifyTypeNew {
                                     try {
                                         Files.deleteIfExists(path);
                                     } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
                                         e.printStackTrace();
                                     }
                                 });
                     } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
                         ex.printStackTrace();
                     }
                 }).start();
@@ -2951,6 +2978,7 @@ public class identifyTypeNew {
                         JSONObject ob = RestUtil.post(pushInfo.getEventUrl(), (JSONObject) JSONObject.toJSON(push));
                         log.info("第三方返回：{}", ob);
                     } catch (Exception e) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
                         log.error("[第三方推送失败] taskId={}", pushInfo.getId(), e);
                     }
 
@@ -2969,6 +2997,7 @@ public class identifyTypeNew {
 
 
             } catch (Exception exception) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(exception);
                 log.error("[报警处理失败] taskId={}", pushInfo.getId(), exception);
             }
         });
@@ -3019,6 +3048,7 @@ public class identifyTypeNew {
             grabber.release();
             log.info("录制完成保存为{}", path);
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             ex.printStackTrace();
             log.error("[出错了检查一下]");
             return "";
@@ -3079,6 +3109,7 @@ public class identifyTypeNew {
                 List<Mat> result = new ArrayList<>();
                 List<String> outBlobNames = net.getUnconnectedOutLayersNames();
                 net.forward(result, outBlobNames);
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.inferred();
 
                 // 处理检测结果
                 float confThreshold = 0.42f;
@@ -3189,6 +3220,7 @@ public class identifyTypeNew {
 //            tt.join();
             return saveMp4Path + "/avi.mp4";
         } catch (Exception ex) {
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(ex);
             ex.printStackTrace();
             log.error("录制失败");
             return "";

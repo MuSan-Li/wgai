@@ -184,7 +184,11 @@ jeecg:
     #webapp文件路径
     webapp: opt/webapp
   shiro:
-    excludeUrls: /test/jeecgDemo/demo3,/test/jeecgDemo/redisDemo/**,/category/**,/visual/**,/map/**,/jmreport/bigscreen2/**,/treeStudy/**,/cn/cuiot/**
+    # /WebSocketSzr/**      数字人播报事件推送。WebSocket 握手带不了 token，
+    #                       不放行会被 Shiro 拦成「身份认证失败」。
+    #                       框架只硬编码放行了 /websocket/** 和 /vxeSocket/**。
+    # /szr/speak/onPlayEvent Python 驱动服务回调「播到第几句」，机器间调用无登录态。
+    excludeUrls: /test/jeecgDemo/demo3,/test/jeecgDemo/redisDemo/**,/category/**,/visual/**,/map/**,/jmreport/bigscreen2/**,/treeStudy/**,/cn/cuiot/**,/WebSocketSzr/**,/szr/speak/onPlayEvent
   #阿里云oss存储和大鱼短信秘钥配置
   oss:
     accessKey: ??

@@ -30,6 +30,7 @@ public class AscendOmSession implements AutoCloseable {
     private static native long[]   nativeOutShape(long handle, int index);
     private static native int      nativeNumOut(long handle);
     private static native void     nativeUnload(long handle);
+    private static native long[]   nativeInputShape(long handle);
 
     /** .so 是否加载成功；失败时调用方回退 ONNX */
     private static volatile boolean libLoaded = false;
@@ -99,6 +100,7 @@ public class AscendOmSession implements AutoCloseable {
     private final long   handle;
     /** 每个输出张量的形状，直接从 om 描述里读，不硬编码 */
     private final long[][] outputShapes;
+    private final long[] inputShape;
     /** ACL 不允许同一 session 并发 execute，这里串行化 */
     private final ReentrantLock lock = new ReentrantLock();
     private volatile boolean closed = false;
@@ -114,6 +116,18 @@ public class AscendOmSession implements AutoCloseable {
             throw new IllegalStateException("om 模型加载失败: " + omPath + " @device" + deviceId);
         }
 
+        long[] shape;
+        try {
+            shape = nativeInputShape(handle);
+        } catch (UnsatisfiedLinkError legacyLibrary) {
+            shape = new long[]{1, 3, 640, 640};
+            log.warn("[昇腾NPU] 当前JNI库无输入形状接口，仅按旧版batch=1运行；多图模型需重新编译om_jni_prod.c");
+        } catch (RuntimeException e) {
+            nativeUnload(handle);
+            throw e;
+        }
+        this.inputShape = shape;
+        log.info("[昇腾NPU] 模型输入 {} shape={}", omPath, java.util.Arrays.toString(shape));
         int n = nativeNumOut(handle);
         this.outputShapes = new long[n][];
         StringBuilder sb = new StringBuilder();
@@ -155,6 +169,8 @@ public class AscendOmSession implements AutoCloseable {
     public int numOutputs() {
         return outputShapes.length;
     }
+
+    public long[] inputShape() { return inputShape.clone(); }
 
     public String getOmPath() {
         return omPath;

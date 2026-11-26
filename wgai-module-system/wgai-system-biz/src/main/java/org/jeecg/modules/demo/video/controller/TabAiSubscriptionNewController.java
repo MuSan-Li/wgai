@@ -50,6 +50,8 @@ import org.jeecg.common.aspect.annotation.AutoLog;
 public class TabAiSubscriptionNewController extends JeecgController<TabAiSubscriptionNew, ITabAiSubscriptionNewService> {
 	@Autowired
 	private ITabAiSubscriptionNewService tabAiSubscriptionNewService;
+    @Autowired private org.jeecg.modules.demo.video.service.impl.SubscriptionHeartbeatService heartbeatService;
+    @org.springframework.beans.factory.annotation.Value("${ai.subscription.runtime-stale-seconds:60}") private long runtimeStaleSeconds = 60;
 	
 	/**
 	 * 分页列表查询
@@ -70,10 +72,33 @@ public class TabAiSubscriptionNewController extends JeecgController<TabAiSubscri
 		QueryWrapper<TabAiSubscriptionNew> queryWrapper = QueryGenerator.initQueryWrapper(tabAiSubscriptionNew, req.getParameterMap());
 		Page<TabAiSubscriptionNew> page = new Page<TabAiSubscriptionNew>(pageNo, pageSize);
 		IPage<TabAiSubscriptionNew> pageList = tabAiSubscriptionNewService.page(page, queryWrapper);
+		for (TabAiSubscriptionNew item : pageList.getRecords()) item.setRuntimeInfo(org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.snapshot(item, Math.max(5, runtimeStaleSeconds)));
 		return Result.OK(pageList);
 	}
 	
-	/**
+    /** Only read the visible subscriptions' status; no dictionary/page refresh on every poll. */
+    @ApiOperation(value = "订阅实时推理状态", notes = "按当前页ID返回本机实际推理进展，与启停标记分开")
+    @GetMapping("/runtimeStatus")
+    public Result<Map<String, Map<String, Object>>> runtimeStatus(
+            @RequestParam(name = "ids") String ids, HttpServletResponse response) {
+        response.setHeader("Cache-Control", "no-store");
+        List<String> requested = Arrays.stream(ids.split(",")).map(String::trim)
+                .filter(id -> !id.isEmpty()).distinct().collect(Collectors.toList());
+        if (requested.size() > 200) return Result.error("每次最多查询200条订阅的实时状态");
+        Map<String, Map<String, Object>> result = new java.util.LinkedHashMap<>();
+        if (requested.isEmpty()) return Result.OK(result);
+        QueryWrapper<TabAiSubscriptionNew> query = QueryGenerator.initQueryWrapper(
+                new TabAiSubscriptionNew(), java.util.Collections.emptyMap());
+        query.select("id", "run_state", "dify_start_end", "dify_start_time").in("id", requested);
+        for (TabAiSubscriptionNew item : tabAiSubscriptionNewService.list(query)) {
+            Map<String, Object> info = org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus
+                    .snapshot(item, Math.max(5, runtimeStaleSeconds));
+            info.put("runState", item.getRunState());
+            result.put(item.getId(), info);
+        }
+        return Result.OK(result);
+    }
+/**
 	 *   添加
 	 *
 	 * @param tabAiSubscriptionNew
@@ -83,10 +108,14 @@ public class TabAiSubscriptionNewController extends JeecgController<TabAiSubscri
 	@ApiOperation(value="多程第三方订阅-添加", notes="多程第三方订阅-添加")
 	//@RequiresPermissions("org.jeecg.modules.demo:tab_ai_subscription_new:add")
 	@PostMapping(value = "/add")
-	public Result<String> add(@RequestBody TabAiSubscriptionNew tabAiSubscriptionNew) {
+	@org.springframework.transaction.annotation.Transactional(rollbackFor = Exception.class)
+    public Result<String> add(@RequestBody TabAiSubscriptionNew tabAiSubscriptionNew,
+                              @RequestParam(name = "syncHeartbeatToOthers", defaultValue = "false") boolean syncHeartbeatToOthers) {
+		org.jeecg.modules.demo.video.util.InferenceOptions.validate(tabAiSubscriptionNew);
 		tabAiSubscriptionNew.setRunState(0);
-		tabAiSubscriptionNewService.save(tabAiSubscriptionNew);
-		return Result.OK("添加成功！");
+        if (!tabAiSubscriptionNewService.save(tabAiSubscriptionNew)) throw new IllegalStateException("订阅保存失败");
+        int synced = syncHeartbeatToOthers ? tabAiSubscriptionNewService.syncHeartbeatToOthers(tabAiSubscriptionNew) : 0;
+        return Result.OK(syncHeartbeatToOthers ? "添加成功，已同步保活配置到其他条目（处理" + synced + "条）" : "添加成功！");
 	}
 	
 	/**
@@ -99,17 +128,24 @@ public class TabAiSubscriptionNewController extends JeecgController<TabAiSubscri
 	@ApiOperation(value="多程第三方订阅-编辑", notes="多程第三方订阅-编辑")
 	//@RequiresPermissions("org.jeecg.modules.demo:tab_ai_subscription_new:edit")
 	@RequestMapping(value = "/edit", method = {RequestMethod.PUT,RequestMethod.POST})
-	public Result<String> edit(@RequestBody TabAiSubscriptionNew tabAiSubscriptionNew) {
+	@org.springframework.transaction.annotation.Transactional(rollbackFor = Exception.class)
+    public Result<String> edit(@RequestBody TabAiSubscriptionNew tabAiSubscriptionNew,
+                               @RequestParam(name = "syncHeartbeatToOthers", defaultValue = "false") boolean syncHeartbeatToOthers) {
+		org.jeecg.modules.demo.video.util.InferenceOptions.validate(tabAiSubscriptionNew);
 		if (tabAiSubscriptionNew.getId() == null || tabAiSubscriptionNew.getId().trim().isEmpty()) {
 			return Result.error("缺少订阅ID");
 		}
+        TabAiSubscriptionNew existing = tabAiSubscriptionNewService.getById(tabAiSubscriptionNew.getId());
+        if (existing == null) return Result.error("订阅不存在");
+        if (Integer.valueOf(1).equals(existing.getRunState())) return Result.error("请先停止订阅再修改配置");
 		// 编辑表单清空时间时，显式写入 NULL，避免默认更新策略保留旧时间。
 		LambdaUpdateWrapper<TabAiSubscriptionNew> update = new LambdaUpdateWrapper<>();
 		update.eq(TabAiSubscriptionNew::getId, tabAiSubscriptionNew.getId())
 			.set(tabAiSubscriptionNew.getDifyStartEnd() == null, TabAiSubscriptionNew::getDifyStartEnd, null)
 			.set(tabAiSubscriptionNew.getDifyStartTime() == null, TabAiSubscriptionNew::getDifyStartTime, null);
-		tabAiSubscriptionNewService.update(tabAiSubscriptionNew, update);
-		return Result.OK("编辑成功!");
+        if (!tabAiSubscriptionNewService.update(tabAiSubscriptionNew, update)) throw new IllegalStateException("订阅保存失败");
+        int synced = syncHeartbeatToOthers ? tabAiSubscriptionNewService.syncHeartbeatToOthers(tabAiSubscriptionNew) : 0;
+        return Result.OK(syncHeartbeatToOthers ? "保存成功，已同步保活配置到其他条目（处理" + synced + "条）" : "编辑成功!");
 	}
 
 
@@ -279,6 +315,29 @@ public class TabAiSubscriptionNewController extends JeecgController<TabAiSubscri
     @RequestMapping(value = "/importExcel", method = RequestMethod.POST)
     public Result<?> importExcel(HttpServletRequest request, HttpServletResponse response) {
         return super.importExcel(request, response, TabAiSubscriptionNew.class);
+    }
+
+    @ApiOperation(value = "保活消息测试上传", notes = "使用当前表单配置，只发送一次，不保存配置或启动推理")
+    @PostMapping("/testHeartbeat")
+    public Result<?> testHeartbeat(@RequestBody TabAiSubscriptionNew config) {
+        java.util.concurrent.CompletableFuture<com.alibaba.fastjson.JSONObject> task = null;
+        try {
+            task = heartbeatService.testUpload(config);
+            // Keep the HTTP response in the original Shiro request. DeferredResult would
+            // cause ASYNC redispatch without this application's thread-bound SecurityManager.
+            // Only this manual test request waits; upload still runs in the dedicated pool.
+            return Result.OK(task.get(5, java.util.concurrent.TimeUnit.SECONDS));
+        } catch (java.util.concurrent.TimeoutException ex) {
+            if (task != null) task.cancel(false);
+            return Result.error("测试上传等待超时，已发送的请求结果可能尚未确认，请通过保活上传日志核对");
+        } catch (InterruptedException ex) {
+            if (task != null) task.cancel(false);
+            Thread.currentThread().interrupt();
+            return Result.error("测试上传等待已中断，请通过保活上传日志核对结果");
+        } catch (java.util.concurrent.ExecutionException ex) {
+            Throwable cause = ex.getCause();
+            return Result.error(cause == null ? "测试上传失败" : cause.getMessage());
+        } catch (Exception ex) { return Result.error(ex.getMessage()); }
     }
 
 }

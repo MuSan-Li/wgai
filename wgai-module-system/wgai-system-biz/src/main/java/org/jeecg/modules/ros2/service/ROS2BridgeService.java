@@ -53,6 +53,9 @@ public class ROS2BridgeService {
     @Autowired
     private ObstacleGuardService obstacleGuardService; // 前向走廊避障（自动导航"前面有东西就停"）
 
+    @org.springframework.beans.factory.annotation.Value("${ros.pointcloud.preview-full-resolution:false}")
+    private boolean fullResolutionPreview;
+
     private WebSocketSession session;
     private final Gson gson = new Gson();
     private final AtomicInteger reconnectAttempts = new AtomicInteger(0);
@@ -66,6 +69,62 @@ public class ROS2BridgeService {
     private volatile double[] lastAmclPose = null;
     /** 最新 AMCL 位姿收到的时间戳(毫秒) */
     private volatile long lastAmclPoseMs = 0L;
+    private long lastAmclSequence;
+    private long lastAmclRosStampNs;
+
+    /** One atomic AMCL sample and its matching odometry reference. */
+    public static final class AmclSample {
+        public final long sequence, receivedAtMs, rosStampNs;
+        public final double[] pose, odomReference;
+        AmclSample(long sequence, long receivedAtMs, double[] pose, double[] odomReference) {
+            this(sequence,receivedAtMs,0,pose,odomReference);
+        }
+        AmclSample(long sequence,long receivedAtMs,long rosStampNs,double[] pose,double[] odomReference) {
+            this.rosStampNs=rosStampNs;
+            this.sequence = sequence; this.receivedAtMs = receivedAtMs;
+            this.pose = pose == null ? null : pose.clone();
+            this.odomReference = odomReference == null ? null : odomReference.clone();
+        }
+    }
+
+    public double[] getOdomPoseAt(long stampNs) {
+        ROS2WebSocketHandler h=activeHandler;
+        return h==null ? null : h.getOdomPoseAt(stampNs);
+    }
+    // Pending samples must survive newer AMCL messages until their ROS-time odometry arrives.
+    private final java.util.ArrayDeque<AmclSample> amclHistory=new java.util.ArrayDeque<>();
+    public synchronized AmclSample refreshAmclSample(AmclSample sample) {
+        if(sample==null || sample.odomReference!=null || sample.rosStampNs<=0) return sample;
+        return new AmclSample(sample.sequence,sample.receivedAtMs,sample.rosStampNs,sample.pose,getOdomPoseAt(sample.rosStampNs));
+    }
+    public synchronized AmclSample getAmclSample() {
+        if (amclOdomRef==null && lastAmclRosStampNs>0) amclOdomRef=getOdomPoseAt(lastAmclRosStampNs);
+        return new AmclSample(lastAmclSequence,lastAmclPoseMs,lastAmclRosStampNs,lastAmclPose,amclOdomRef);
+    }
+    /** Chronological observations: inspect every correction, including superseded pending samples. */
+    public synchronized java.util.List<AmclSample> getAmclSamplesAfter(long sequence) {
+        java.util.List<AmclSample> result=new java.util.ArrayList<>();
+        if(amclHistory.isEmpty()) {
+            AmclSample sample=getAmclSample();
+            if(sample.sequence>sequence) result.add(sample);
+        } else {
+            for(AmclSample sample:amclHistory) if(sample.sequence>sequence) result.add(refreshAmclSample(sample));
+        }
+        return result;
+    }
+    public synchronized Map<String,Object> localizationTiming(AmclSample sample) {
+        Map<String,Object> d=new java.util.LinkedHashMap<>();
+        AmclSample latest=getAmclSample();
+        if(sample==null) sample=latest;
+        d.put("amclSequence",sample.sequence);d.put("amclStampNs",sample.rosStampNs);
+        d.put("amclReceiptAgeMs",Math.max(0,System.currentTimeMillis()-sample.receivedAtMs));
+        d.put("latestAmclSequence",latest.sequence);d.put("latestAmclStampNs",latest.rosStampNs);
+        if(sample.rosStampNs>0)d.put("amclAgeAtReceiptMs",sample.receivedAtMs-sample.rosStampNs/1_000_000L);
+        ROS2WebSocketHandler h=activeHandler;
+        d.put("odom",h==null ? java.util.Collections.singletonMap("reason","NO_ROS_HANDLER") : h.getOdomTiming(sample.rosStampNs));
+        d.put("amclHistoryCount",amclHistory.size());
+        return d;
+    }
     /** 最新 AMCL 位姿协方差: x方差(covariance[0]) / y方差(covariance[7]), 用于判断是否真正收敛 */
     private volatile double lastAmclCovXX = Double.MAX_VALUE;
     private volatile double lastAmclCovYY = Double.MAX_VALUE;
@@ -162,11 +221,11 @@ public class ROS2BridgeService {
      * 如果从未收到过数据，返回 null。
      * MapController 的位姿自动保存定时任务直接调此方法，无需 fork 任何进程。
      */
-    public double[] getLastAmclPose() {
-        return lastAmclPose;
+    public synchronized double[] getLastAmclPose() {
+        return lastAmclPose == null ? null : lastAmclPose.clone();
     }
 
-    /** 收到最近一次 /amcl_pose 时的里程计位姿 [x,y,theta]，null = 当时没有新鲜里程计 */
+    /** 最近一次 /amcl_pose 的 ROS 时间戳对应的里程计位姿 [x,y,theta]，null = 当时没有新鲜里程计 */
     private volatile double[] amclOdomRef = null;
 
     /**
@@ -175,15 +234,9 @@ public class ROS2BridgeService {
      * 但 fast_lio 一直在跑，拿它把上次 AMCL 位姿推到现在，精度≈AMCL 本身 + 里程计短时漂移(厘米级)。
      * @return null = 没有 AMCL 位姿，或里程计(当时/现在)不新鲜
      */
-    public double[] getEstimatedMapPose() {
-        double[] a = lastAmclPose, ref = amclOdomRef, now = getOdomPose(1500);
-        if (a == null || ref == null || now == null) return null;
-        double dx = now[0] - ref[0], dy = now[1] - ref[1];
-        double c0 = Math.cos(ref[2]), s0 = Math.sin(ref[2]);
-        double lx = c0 * dx + s0 * dy, ly = -s0 * dx + c0 * dy;          // 位移换到当时的车体系
-        double ca = Math.cos(a[2]), sa = Math.sin(a[2]);
-        double th = a[2] + (now[2] - ref[2]);
-        return new double[]{a[0] + ca * lx - sa * ly, a[1] + sa * lx + ca * ly, Math.atan2(Math.sin(th), Math.cos(th))};
+    public synchronized double[] getEstimatedMapPose() {
+        getAmclSample(); // Matching odometry can arrive after AMCL.
+        return NavigationGeometry.predict(lastAmclPose, amclOdomRef, getOdomPose(1500));
     }
 
     /** 最近一次收到 /amcl_pose 的时刻(ms)，0 = 没收到过 */
@@ -222,7 +275,7 @@ public class ROS2BridgeService {
      * 由 ROS2WebSocketHandler 在每次收到 /amcl_pose 消息时回调，更新本地缓存。
      * msg 是 rosbridge publish 帧里的 "msg" 字段（geometry_msgs/PoseWithCovarianceStamped）。
      */
-    public void updateAmclPose(JsonObject msg) {
+    public synchronized boolean updateAmclPose(JsonObject msg) {
         try {
             JsonObject poseWithCov = msg.getAsJsonObject("pose");
             JsonObject pose        = poseWithCov.getAsJsonObject("pose");
@@ -231,13 +284,28 @@ public class ROS2BridgeService {
 
             double x     = position.get("x").getAsDouble();
             double y     = position.get("y").getAsDouble();
-            double qz    = orientation.get("z").getAsDouble();
-            double qw    = orientation.get("w").getAsDouble();
-            double theta = 2.0 * Math.atan2(qz, qw);
-
+            double qx = orientation.has("x") ? orientation.get("x").getAsDouble() : 0;
+            double qy = orientation.has("y") ? orientation.get("y").getAsDouble() : 0;
+            double qz = orientation.get("z").getAsDouble(), qw = orientation.get("w").getAsDouble();
+            double theta = Math.atan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz));
+            if (!NavigationGeometry.finitePose(new double[]{x, y, theta})) {
+                log.warn("[定位数据无效] 忽略非有限 AMCL 位姿");
+                return false;
+            }
+            long stampNs = 0;
+            if (msg.has("header") && msg.getAsJsonObject("header").has("stamp")) {
+                JsonObject stamp = msg.getAsJsonObject("header").getAsJsonObject("stamp");
+                stampNs = stamp.get("sec").getAsLong() * 1_000_000_000L + stamp.get("nanosec").getAsLong();
+                if (stampNs > 0 && stampNs <= lastAmclRosStampNs) return false;
+            }
+            lastAmclRosStampNs = stampNs;
+            lastAmclSequence++;
             lastAmclPose   = new double[]{x, y, theta};
             lastAmclPoseMs = System.currentTimeMillis();
-            amclOdomRef    = getOdomPose(300);   // 同一时刻的里程计，用来往后推算(见 getEstimatedMapPose)
+            amclOdomRef    = getOdomPoseAt(stampNs);   // 按 ROS 时间戳插值；缺少匹配样本时不使用到达时刻的里程计
+
+            amclHistory.addLast(new AmclSample(lastAmclSequence,lastAmclPoseMs,stampNs,lastAmclPose,amclOdomRef));
+            while(amclHistory.size()>256) amclHistory.removeFirst();
 
             if (poseWithCov.has("covariance")) {
                 com.google.gson.JsonArray cov = poseWithCov.getAsJsonArray("covariance");
@@ -246,8 +314,10 @@ public class ROS2BridgeService {
                     lastAmclCovYY = cov.get(7).getAsDouble();
                 }
             }
+            return true;
         } catch (Exception e) {
             log.warn("[amcl_pose缓存] 解析失败: {}", e.getMessage());
+            return false;
         }
     }
 
@@ -268,9 +338,11 @@ public class ROS2BridgeService {
                     this::onServiceResponse,
                     this::updateAmclPose      // ← 新增：/amcl_pose 收到时更新本地缓存
             );
+            handler.setFullResolutionPreview(fullResolutionPreview);
             handler.setNavTerminalListener(this::fireNavTerminal);
             handler.setPlanListener(() -> planListeners.forEach(Runnable::run));
             handler.setNavMode(desiredNavMode);   // 重连后把位姿来源模式重新喂给新 handler
+            synchronized(this) { amclHistory.clear(); amclOdomRef=null; }
             activeHandler = handler;
             webSocketHandler = handler;
 
@@ -348,10 +420,10 @@ public class ROS2BridgeService {
         subscribe("/cloud_registered", "sensor_msgs/PointCloud2", 200);
 
         // ② fast_lio 里程计（机器人实时位姿）
-        subscribe("/Odometry", "nav_msgs/Odometry", 100);
+        subscribe("/Odometry", "nav_msgs/Odometry", 0);
 
         // ③ AMCL 定位（导航时比里程计更准）
-        subscribe("/amcl_pose", "geometry_msgs/PoseWithCovarianceStamped", 200);
+        subscribe("/amcl_pose", "geometry_msgs/PoseWithCovarianceStamped", 0);
 
         // ④ Nav2 规划路径（路径不显示的原因就是没订阅这个！）
         //    Nav2 把规划路径发布到 /plan，前端需要这个来画路径线
@@ -376,9 +448,8 @@ public class ROS2BridgeService {
         json.addProperty("op", "subscribe");
         json.addProperty("topic", topic);
         json.addProperty("type", type);
-        if (throttleRate > 0) {
-            json.addProperty("throttle_rate", throttleRate);
-        }
+        if ("/cloud_registered".equals(topic)) json.addProperty("queue_length", 1);
+        json.addProperty("throttle_rate", throttleRate);
         send(json.toString());
         log.info("  已订阅: {} ({}), 节流: {}ms", topic, type, throttleRate);
     }
@@ -424,7 +495,7 @@ public class ROS2BridgeService {
 
         // 再 subscribe(此时 Nav2 已起来,DDS discovery 能正确握手)
         subscribe("/plan",        "nav_msgs/Path", 500);
-        subscribe("/amcl_pose",   "geometry_msgs/PoseWithCovarianceStamped", 200);
+        subscribe("/amcl_pose",   "geometry_msgs/PoseWithCovarianceStamped", 0);
         subscribe("/navigate_to_pose/_action/status",
                 "action_msgs/GoalStatusArray", 500);
         log.info("✅ Nav2 topic 已重新订阅");
@@ -457,7 +528,7 @@ public class ROS2BridgeService {
         try { Thread.sleep(300); } catch (InterruptedException ignored) {}
 
         subscribe("/cloud_registered", "sensor_msgs/PointCloud2", 200);
-        subscribe("/Odometry", "nav_msgs/Odometry", 100);
+        subscribe("/Odometry", "nav_msgs/Odometry", 0);
         log.info("✅ fast_lio topic 已重新订阅");
     }
 
@@ -493,7 +564,7 @@ public class ROS2BridgeService {
                 lastOdomResubMs = now;
                 log.warn("[里程计看门狗] {}ms 没收到 /Odometry，补发订阅 /Odometry /cloud_registered。"
                         + "若持续出现，在机器人上 ros2 topic hz /Odometry 确认 fast_lio 是否在跑", now - (long) p[3]);
-                subscribe("/Odometry", "nav_msgs/Odometry", 100);
+                subscribe("/Odometry", "nav_msgs/Odometry", 0);
                 subscribe("/cloud_registered", "sensor_msgs/PointCloud2", 200);
             }
         } catch (Exception e) {

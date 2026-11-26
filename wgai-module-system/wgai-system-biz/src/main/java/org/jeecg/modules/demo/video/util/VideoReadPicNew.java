@@ -2,6 +2,9 @@ package org.jeecg.modules.demo.video.util;
 
 import lombok.extern.slf4j.Slf4j;
 import org.jeecg.modules.demo.video.util.VideoDecodePolicy;
+import org.jeecg.modules.demo.video.util.InferenceOptions;
+import org.jeecg.modules.demo.video.util.FrameTask;
+import org.jeecg.modules.demo.video.util.LatestFrameExecutor;
 import org.jeecg.modules.demo.video.util.VideoFrameGate;
 import org.jeecg.modules.demo.video.util.FrameMatView;
 import org.jeecg.modules.demo.video.util.StreamLagTracker;
@@ -55,7 +58,6 @@ public class VideoReadPicNew implements Runnable {
     private final AtomicBoolean forceShutdown = new AtomicBoolean(false);
 
     // 关键修改2：帧丢弃策略 - 解决延迟累积问题
-    private static final int MAX_PENDING_FRAMES = 1; // 最大排队帧数
     private final AtomicInteger pendingFrames = new AtomicInteger(0);
     private volatile long lastProcessTime = System.currentTimeMillis();
 
@@ -102,13 +104,13 @@ public class VideoReadPicNew implements Runnable {
                 1, // 核心线程数减少
                 1, // 最大线程数减少
                 60L, TimeUnit.SECONDS,
-                new ArrayBlockingQueue<>(5), // 限制队列大小，防止积压
+                new ArrayBlockingQueue<>(InferenceOptions.capacity(tabAiSubscriptionNew)), // 限制队列大小，防止积压
                 r -> {
                     Thread t = new Thread(r, "VideoProcessor-" + streamId + "-" + tabAiSubscriptionNew.getName());
                     t.setDaemon(true); // 设置为守护线程
                     return t;
                 },
-                new ThreadPoolExecutor.AbortPolicy()
+                LatestFrameExecutor.dropOldest()
         );
     }
 
@@ -190,11 +192,6 @@ public class VideoReadPicNew implements Runnable {
                 lastFrameTime = currentTime;
 
                 // 关键修改5：队列长度控制 - 防止延迟累积
-                if (pendingFrames.get() >= MAX_PENDING_FRAMES) {
-                    log.info("[丢弃帧以防止延迟累积] 当前排队: {}", pendingFrames.get());
-                    droppedFrames.incrementAndGet();
-                    continue;
-                }
 
                 // 异步处理帧 - 改进版
                 processFrameAsyncOptimized(frame, netPushList, identifyTypeAll);
@@ -204,6 +201,7 @@ public class VideoReadPicNew implements Runnable {
             }
 
         } catch (Exception exception) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(exception);
             log.error("[处理异常]", exception);
         } finally {
             log.info("[开始清理资源]");
@@ -224,6 +222,7 @@ public class VideoReadPicNew implements Runnable {
         try {
             frameClone = frame.clone();
         } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[Frame克隆失败]: {}", e.getMessage());
             droppedFrames.incrementAndGet();
             return;
@@ -231,10 +230,11 @@ public class VideoReadPicNew implements Runnable {
         pendingFrames.incrementAndGet();
         final Frame finalFrame = frameClone;
         try {
-        processingExecutor.execute(() -> {
+        processingExecutor.execute(new FrameTask(() -> {
             long startTime = System.currentTimeMillis();
             Mat matInfo = null;
             RecognitionTrace trace = RecognitionTrace.begin(streamId, decodedNanos);
+            org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.begin(tabAiSubscriptionNew);
             long queueMs = trace.elapsedMillis();
             String workerName = Thread.currentThread().getName();
             Thread.currentThread().setName(workerName + "-frame=" + trace.frameId);
@@ -273,6 +273,7 @@ public class VideoReadPicNew implements Runnable {
                 }
 
                 processedFrames.incrementAndGet();
+                org.jeecg.modules.demo.video.util.SubscriptionHeartbeatState.completed(tabAiSubscriptionNew);
                 lastProcessTime = System.currentTimeMillis();
                 //setBeforeImg(matInfo,"cc");
                 // 性能警告
@@ -282,6 +283,7 @@ public class VideoReadPicNew implements Runnable {
                 }
 
             } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
                 log.error("[帧处理异常]", e);
             } finally {
                 // 快速资源清理
@@ -297,7 +299,9 @@ public class VideoReadPicNew implements Runnable {
                         streamId, tabAiSubscriptionNew.getName(), trace.frameId, queueMs, elapsedMs, trace.elapsedMillis());
                 pendingFrames.decrementAndGet();
             }
-        });
+        }, () -> {
+            finalFrame.close(); pendingFrames.decrementAndGet(); droppedFrames.incrementAndGet();
+        }));
 
         } catch (RejectedExecutionException e) {
             finalFrame.close(); pendingFrames.decrementAndGet(); droppedFrames.incrementAndGet();
@@ -339,6 +343,7 @@ public class VideoReadPicNew implements Runnable {
             }
 
         } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[处理NetPush异常] 模型: {}",
                     netPush.getTabAiModel() != null ? netPush.getTabAiModel().getAiName() : "unknown", e);
         }
@@ -383,6 +388,7 @@ public class VideoReadPicNew implements Runnable {
             }
 
         } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[执行检测异常] 模型类型: {}", netPush.getModelType(), e);
         }
     }
@@ -432,6 +438,7 @@ public class VideoReadPicNew implements Runnable {
                         beforePush.getClaseeNames(), beforePush,redisTemplate);
             }
         } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.error("[验证模型异常]", e);
             return null;
         }
@@ -450,6 +457,7 @@ public class VideoReadPicNew implements Runnable {
         try {
             if (!processingExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
                 List<Runnable> pendingTasks = processingExecutor.shutdownNow();
+                pendingTasks.forEach(FrameTask::discard);
                 log.warn("[强制终止线程池，剩余任务: {}]", pendingTasks.size());
 
                 // 再等待2秒
@@ -458,7 +466,7 @@ public class VideoReadPicNew implements Runnable {
                 }
             }
         } catch (InterruptedException e) {
-            processingExecutor.shutdownNow();
+            LatestFrameExecutor.shutdownNow(processingExecutor);
             Thread.currentThread().interrupt();
         }
 
@@ -477,6 +485,7 @@ public class VideoReadPicNew implements Runnable {
             identifyTypeNewLocal.remove();
             threadLocalPushInfo.remove();
         } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.warn("[ThreadLocal清理异常]", e);
         }
 
@@ -489,6 +498,7 @@ public class VideoReadPicNew implements Runnable {
             try {
                 mat.release();
             } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
                 log.info("[Mat释放异常]", e);
             }
         }
@@ -547,6 +557,7 @@ public class VideoReadPicNew implements Runnable {
         try {
             return Boolean.TRUE.equals(RedisCacheHolder.get(streamId + "newRunPush"));
         } catch (Exception e) {
+                org.jeecg.modules.demo.video.util.SubscriptionRuntimeStatus.failed(e);
             log.warn("[检查流状态异常]", e);
             return false;
         }

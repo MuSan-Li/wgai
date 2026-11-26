@@ -32,6 +32,8 @@ import lombok.experimental.Accessors;
 @ApiModel(value="tab_ai_subscription_new对象", description="多程第三方订阅")
 public class TabAiSubscriptionNew implements Serializable {
     private static final long serialVersionUID = 1L;
+    @TableField(exist = false)
+    private java.util.Map<String, Object> runtimeInfo;
 
 	/**id*/
 	@TableId(type = IdType.ASSIGN_ID)
@@ -174,9 +176,36 @@ public class TabAiSubscriptionNew implements Serializable {
     @ApiModelProperty(value = "是否开启区域识别")
     private java.lang.Integer isBy;
 
-    @ApiModelProperty(value = "解码方式")
+    @ApiModelProperty(value = "推理方式：20=ONNX，100=OM，其余沿用OpenCV")
     @Dict(dicCode = "model_type")
     private Integer modelJmType;
+
+    @ApiModelProperty(value = "本订阅等待帧上限，满时丢弃最旧帧，默认5")
+    private Integer inferenceQueueCapacity;
+
+    @ApiModelProperty(value = "开启批量处理：0关闭（默认），1开启后按模型实际batch处理")
+    private Integer inferenceBatchEnabled;
+
+    @ApiModelProperty(value = "动态batch模型每批图片上限，默认4；固定batch读取模型")
+    private Integer inferenceBatchSize;
+
+    @ApiModelProperty(value = "凑批等待毫秒数，默认30")
+    private Integer inferenceBatchWaitMs;
+
+    @ApiModelProperty(value = "保活消息推送：0关闭，1开启，独立于告警推送")
+    private Integer heartbeatEnabled;
+
+    @ApiModelProperty(value = "保活英文名称/serverCode")
+    private String heartbeatServerCode;
+
+    @ApiModelProperty(value = "保活名称/serverName")
+    private String heartbeatServerName;
+
+    @ApiModelProperty(value = "保活POST地址，不使用推理或告警地址")
+    private String heartbeatUrl;
+
+    @ApiModelProperty(value = "保活推送间隔秒数，默认30，范围5至3600")
+    private Integer heartbeatIntervalSeconds;
 
     @ApiModelProperty(value = "推送开始时间")
     private Integer difyStartEnd;

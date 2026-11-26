@@ -29,4 +29,6 @@ public interface ITabAiSubscriptionNewService extends IService<TabAiSubscription
     public Result<?> test(String id);
 
     public void restartAi(String videoId);
+
+    int syncHeartbeatToOthers(TabAiSubscriptionNew source);
 }

@@ -11,3 +11,6 @@ rebel.xml
 **/*.lock
 /wgai-module-system/.claude/
 /wgai-module-system/.claude/
+/wgai-module-system/wgai-system-biz/docs/
+/wgai-module-system/wgai-system-biz/scripts/
+/wgai-module-system/wgai-system-biz/tools/

@@ -1,6 +1,7 @@
 package org.jeecg.modules.demo.tab.controller;
 
 import java.util.Arrays;
+import org.jeecg.modules.tab.AIModel.onnx.JavaVideoPushWorker;
 import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
@@ -122,6 +123,59 @@ public class TabAiModelBundController extends JeecgController<TabAiModelBund, IT
 		 queryWrapper.eq(TabAiModelBund::getSpaceOne,"1");
 		 return Result.OK(tabAiModelBundService.list(queryWrapper));
 	 }
+
+    @GetMapping("/pushStatus")
+    public Result<com.alibaba.fastjson.JSONObject> pushStatus(@RequestParam String id) {
+        return Result.OK(JavaVideoPushWorker.status(id));
+    }
+
+    /**共享已保存的视频脚本引用，不读取或执行脚本内容。*/
+    @ApiOperation(value = "可复用的 Python 视频脚本")
+    @GetMapping("/pythonScripts")
+    public Result<List<String>> pythonScripts() {
+        QueryWrapper<TabAiModelBund> query = new QueryWrapper<>();
+        query.select("DISTINCT python_script_path")
+             .isNotNull("python_script_path").ne("python_script_path", "")
+             .orderByAsc("python_script_path");
+        List<String> scripts = tabAiModelBundService.list(query).stream()
+            .map(TabAiModelBund::getPythonScriptPath).collect(Collectors.toList());
+        return Result.OK(scripts);
+    }
+
+    // 编辑接口也供其他页面局部更新；未传字段按已保存值校验，不覆盖旧配置。
+    private String validatePushConfig(TabAiModelBund incoming, TabAiModelBund existing) {
+        TabAiModelBund old = existing == null ? new TabAiModelBund() : existing;
+        String mode = configValue(incoming.getRecognitionMode(), old.getRecognitionMode());
+        if (!"2".equals(mode)) return null;
+        Integer decode = incoming.getGpuDecode() == null ? old.getGpuDecode() : incoming.getGpuDecode();
+        if (decode != null && decode != 0 && decode != 1) return "GPU 解码配置只能为0或1";
+        String engine = configValue(incoming.getExecutionEngine(), old.getExecutionEngine());
+        if (engine == null) engine = "java";
+        if (!"java".equals(engine) && !"python".equals(engine)) return "执行方式只能为java或python";
+        String type = configValue(incoming.getSpaceOne(), old.getSpaceOne());
+        if ("0".equals(type)) return "图片识别不支持视频流推送重组";
+        String input = configValue(incoming.getInferenceVideoUrl(), old.getInferenceVideoUrl());
+        String output = configValue(incoming.getZlmPushUrl(), old.getZlmPushUrl());
+        String script = configValue(incoming.getPythonScriptPath(), old.getPythonScriptPath());
+        Integer fps = incoming.getInferenceFps() == null ? old.getInferenceFps() : incoming.getInferenceFps();
+        if (!validStreamAddress(input)) return "请填写有效的推理视频流地址";
+        if (!validStreamAddress(output) || !output.matches("(?i)^rtmps?://.+|^rtsp://.+")) return "ZLM 推流地址须使用 RTMP(S) 或 RTSP";
+        if (fps == null || fps < 1 || fps > 60) return "识别频率须为 1至60 的整数";
+        if ("python".equals(engine) && (StringUtils.isBlank(script) || script.length() > 1024 || !script.toLowerCase(java.util.Locale.ROOT).endsWith(".py"))) {
+            return "请选择或上传 Python 脚本（.py）";
+        }
+        return null;
+    }
+
+    private String configValue(String incoming, String existing) {
+        return incoming == null ? existing : incoming;
+    }
+
+    private boolean validStreamAddress(String value) {
+        return StringUtils.isNotBlank(value) && value.length() <= 1024
+            && value.matches("(?i)^(rtsp|rtsps|rtmp|rtmps|http|https|ws|wss)://[^\\s/]+(?:/[^\\s]*)?$");
+    }
+
 	 @Value(value = "${jeecg.path.upload}")
 	 private String uploadpath;
 	/**
@@ -135,7 +189,9 @@ public class TabAiModelBundController extends JeecgController<TabAiModelBund, IT
 	//@RequiresPermissions("org.jeecg.modules.demo:tab_ai_model_bund:add")
 	@PostMapping(value = "/add")
 	public Result<String> add(@RequestBody TabAiModelBund tabAiModelBund) {
-		if(tabAiModelBund.getSpaceOne().equals("0")){
+        String configError = validatePushConfig(tabAiModelBund, null);
+        if (configError != null) return Result.error(configError);
+		if("0".equals(tabAiModelBund.getSpaceOne())){
 			if(StringUtils.isEmpty(tabAiModelBund.getSaveUrl())&&StringUtils.isNotEmpty(tabAiModelBund.getSendUrl())){
 				AIModelYolo3 modelYolo3=new AIModelYolo3();
 				String saveurl=modelYolo3.SavePicInLocalhost(tabAiModelBund.getSendUrl(),uploadpath);
@@ -158,6 +214,10 @@ public class TabAiModelBundController extends JeecgController<TabAiModelBund, IT
 	//@RequiresPermissions("org.jeecg.modules.demo:tab_ai_model_bund:edit")
 	@RequestMapping(value = "/edit", method = {RequestMethod.PUT,RequestMethod.POST})
 	public Result<String> edit(@RequestBody TabAiModelBund tabAiModelBund) {
+        TabAiModelBund existing = tabAiModelBundService.getById(tabAiModelBund.getId());
+        if (existing == null) return Result.error("未找到对应数据");
+        String configError = validatePushConfig(tabAiModelBund, existing);
+        if (configError != null) return Result.error(configError);
 		tabAiModelBundService.updateById(tabAiModelBund);
 		return Result.OK("编辑成功!");
 	}

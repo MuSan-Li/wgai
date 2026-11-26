@@ -62,6 +62,14 @@ import static org.jeecg.modules.tab.AIModel.onnx.VideoReadOnnxPose.isBoundingBox
 @Slf4j
 public class VideoReadOnnx implements Runnable {
 
+    java.util.function.Consumer<JSONObject> frameResultSink;
+    java.util.function.Consumer<String> inferenceFailureSink;
+
+    private void emitVideoResult(JSONObject payload) {
+        if (frameResultSink != null) frameResultSink.accept(payload);
+        else webSocket.sendMessage(payload.toJSONString());
+    }
+
     private RedisTemplate redisTemplate;
     public Integer TARGET_FRAME_INTERVAL = 300;
     public String videoUrl;
@@ -350,7 +358,7 @@ public class VideoReadOnnx implements Runnable {
         return rawStreamPts - streamPtsBaseMs;
     }
 
-    private void processFrame(Frame frame, long grabTimestamp, long streamPts, long rawStreamPts) {
+    void processFrame(Frame frame, long grabTimestamp, long streamPts, long rawStreamPts) {
         Frame frameClone = null;
         Mat   matInfo    = null;
         long frameStartMs = System.currentTimeMillis();
@@ -368,6 +376,7 @@ public class VideoReadOnnx implements Runnable {
 
         } catch (Exception e) {
             log.error("[processFrame 异常]", e);
+            if (inferenceFailureSink != null) inferenceFailureSink.accept("推理失败：" + e.getMessage());
         } finally {
             int frameIndex = startupProcessLogCounter.incrementAndGet();
             long costMs = System.currentTimeMillis() - frameStartMs;
@@ -390,7 +399,7 @@ public class VideoReadOnnx implements Runnable {
         bja.put("tracking",  true);
         bja.put("list",      new ArrayList<>());
         bja.put("reason",    reason);
-        webSocket.sendMessage(bja.toJSONString());
+        emitVideoResult(bja);
     }
 
     public boolean detectObjectsDifyOnnx(Mat image, NetPush netPush,
@@ -418,6 +427,7 @@ public class VideoReadOnnx implements Runnable {
                 detectionResult = runOnnxInference(session, env, inputData, expectedClassCount, confThreshold);
             } catch (Exception ex) {
                 log.error("ONNX推理失败", ex);
+                if (inferenceFailureSink != null) inferenceFailureSink.accept("ONNX推理失败：" + ex.getMessage());
                 return false;
             }
 
@@ -430,7 +440,7 @@ public class VideoReadOnnx implements Runnable {
                 if (emptyIndex <= 10 || inferMs > 1000) {
                     log.info("目标检测耗时: {}ms, 检测: 0, 追踪: 0, emptyIndex={}", inferMs, emptyIndex);
                 }
-                webSocket.sendMessage(bja.toJSONString());
+                emitVideoResult(bja);
                 return true;
             }
             if (detectionCount > 200) { log.warn("检测数量异常: {}", detectionCount); return false; }
@@ -472,7 +482,7 @@ public class VideoReadOnnx implements Runnable {
             // ── ByteTracker 仍运行（不用于 permId 分配）────────────────────
             if (cache.isEmpty()) {
                 JSONObject bja = buildBridgeFrame(netPush, classNames, grabTimestamp, rawStreamPts);
-                webSocket.sendMessage(bja.toJSONString());
+                emitVideoResult(bja);
                 return true;
             }
 
@@ -523,7 +533,7 @@ public class VideoReadOnnx implements Runnable {
             long inferMs = System.currentTimeMillis() - startTime;
             log.info("目标检测耗时: {}ms, 检测: {}, 追踪: {}", inferMs, cache.size(), trackResults.size());
 
-            webSocket.sendMessage(bja.toJSONString());
+            emitVideoResult(bja);
             return true;
 
         } finally {
@@ -793,13 +803,23 @@ public class VideoReadOnnx implements Runnable {
         if (grabber != null) { grabber.stop(); grabber.release(); }
         return createOptimizedGrabber();
     }
-    private boolean isStreamActive() {
+    boolean isStreamActive() {
         try { return RedisCacheHolder.get(tabAiModelBund.getId() + "videoRead"); }
         catch (Exception e) { log.warn("[检查流状态异常]", e); return false; }
     }
     public FFmpegFrameGrabber createOptimizedGrabber() throws Exception {
         // 将解封装器的原始警告接入Java日志，保留未知FLV编码等关键诊断信息。
         FFmpegLogCallback.set();
+        if ("2".equals(tabAiModelBund.getRecognitionMode())) {
+            if (!Integer.valueOf(1).equals(tabAiModelBund.getGpuDecode())) return startGrabber("CPU", null, null);
+            if (codecName == null) {
+                FFmpegFrameGrabber probe = startGrabber("编码探测", null, null);
+                releaseGrabberQuietly(probe);
+            }
+            String decoder = resolveNvidiaCodecName();
+            if (decoder == null) throw new IllegalArgumentException("GPU 解码仅支持 H.264/H.265，当前为 " + codecName);
+            return startGrabber("NVIDIA", "cuda", decoder);
+        }
         log.info("[视频解码运行库] FFmpeg={}, HTTP-FLV={}",
                 avutil.av_version_info().getString(), isHttpFlvUrl());
         Exception lastException = null;

@@ -37,6 +37,56 @@ public class WebSocketPushService {
     @Autowired
     private WebSocket webSocket;
 
+    // 有界的当前状态缓存：供新页面/重连补回推送；不缓存点云、控制指令或个人通知。
+    private final String runtimeId = java.util.UUID.randomUUID().toString();
+    private long runtimeRevision;
+    private final java.util.Map<String, String> navigationEvents = new java.util.LinkedHashMap<>();
+
+    private synchronized void remember(JSONObject message) {
+        String type = message.getString("type");
+        if (!java.util.Arrays.asList("path_update", "maneuver_status", "localization_status", "nav_status").contains(type)) return;
+        if ("path_update".equals(type) && navigationEvents.containsKey("maneuver_status")) {
+            JSONObject task = JSONObject.parseObject(navigationEvents.get("maneuver_status")).getJSONObject("data");
+            if (task != null && java.util.Arrays.asList("done", "failed", "canceled").contains(task.getString("phase"))) return;
+        }
+        message.put("runtimeId", runtimeId);
+        message.put("revision", ++runtimeRevision);
+        JSONObject cached = JSONObject.parseObject(message.toJSONString());
+        if ("maneuver_status".equals(type)) {
+            JSONObject current = cached.getJSONObject("data");
+            if (current != null && java.util.Arrays.asList("done", "failed", "canceled").contains(current.getString("phase"))) {
+                navigationEvents.remove("path_update");
+            }
+            String previousJson = navigationEvents.get(type);
+            JSONObject previous = previousJson == null ? null : JSONObject.parseObject(previousJson).getJSONObject("data");
+            // 页面原本保留最近压线快照。后续侧移/PLC失败无extra时，刷新也应保留同一任务的诊断。
+            if (current != null && previous != null && current.getLongValue("missionId") == previous.getLongValue("missionId")
+                    && !current.getBooleanValue("clearDiagnostic") && !current.containsKey("hits")
+                    && !"done".equals(current.getString("phase")) && !"canceled".equals(current.getString("phase"))
+                    && previous.containsKey("hits")) {
+                for (String key : previous.keySet()) {
+                    if (java.util.Arrays.asList("missionId", "startedAtMs", "goal", "phase", "message", "ok", "clearDiagnostic").contains(key)) continue;
+                    if (!current.containsKey(key)) current.put(key, previous.get(key));
+                }
+            }
+        }
+        navigationEvents.put(type, cached.toJSONString());
+    }
+
+    public synchronized java.util.Map<String, Object> navigationSnapshot() {
+        java.util.Map<String, Object> result = new java.util.LinkedHashMap<>();
+        java.util.List<JSONObject> events = new java.util.ArrayList<>();
+        for (String event : navigationEvents.values()) events.add(JSONObject.parseObject(event));
+        events.sort(java.util.Comparator.comparingLong(e -> e.getLongValue("revision")));
+        result.put("runtimeId", runtimeId); result.put("revision", runtimeRevision);
+        result.put("events", events);
+        return result;
+    }
+
+    public synchronized void clearNavigationSnapshot() {
+        navigationEvents.clear(); ++runtimeRevision;
+    }
+
     // ─────────────────── 点云按需推送 ───────────────────
     //
     // ⚠ 点云每帧 ~3000 点、按 JSON 对象编码 ~100KB，5Hz ≈ 4Mbps，而且以前不管谁在看都广播。
@@ -74,6 +124,7 @@ public class WebSocketPushService {
             message.put("type",      "cmd_vel_update");
             message.put("data",      vo);
             message.put("timestamp", System.currentTimeMillis());
+            remember(message);
             webSocket.pushMessage(message.toJSONString());   // ① 高频广播
         } catch (Exception e) {
             log.error("推送速度数据失败", e);
@@ -90,6 +141,7 @@ public class WebSocketPushService {
             message.put("type",      "robot_pose");
             message.put("data",      poseData);
             message.put("timestamp", System.currentTimeMillis());
+            remember(message);
             webSocket.pushMessage(message.toJSONString());   // ① 高频广播
         } catch (Exception e) {
             log.error("推送机器人位姿失败", e);
@@ -105,6 +157,7 @@ public class WebSocketPushService {
             message.put("type",      "position");
             message.put("data",      position);
             message.put("timestamp", System.currentTimeMillis());
+            remember(message);
             webSocket.pushMessage(message.toJSONString());   // ① 高频广播
         } catch (Exception e) {
             log.error("推送位置数据失败", e);
@@ -123,6 +176,7 @@ public class WebSocketPushService {
             message.put("type",      "path_update");
             message.put("data",      pathData);
             message.put("timestamp", System.currentTimeMillis());
+            remember(message);
             webSocket.pushMessageReliable(message.toJSONString());  // ② 可靠广播
         } catch (Exception e) {
             log.error("推送路径数据失败", e);
@@ -139,6 +193,7 @@ public class WebSocketPushService {
             message.put("type",      "nav_status");
             message.put("data",      statusData);
             message.put("timestamp", System.currentTimeMillis());
+            remember(message);
             webSocket.pushMessageReliable(message.toJSONString());  // ② 可靠广播
         } catch (Exception e) {
             log.error("推送导航状态失败", e);
@@ -154,6 +209,7 @@ public class WebSocketPushService {
             message.put("type",      "map");
             message.put("data",      mapData);
             message.put("timestamp", System.currentTimeMillis());
+            remember(message);
             webSocket.pushMessageReliable(message.toJSONString());  // ② 可靠广播
         } catch (Exception e) {
             log.error("推送地图数据失败", e);
@@ -173,6 +229,7 @@ public class WebSocketPushService {
             payload.put("status",    status);
             payload.put("waitMs",    15000);               // 前端倒计时参考值
             payload.put("timestamp", System.currentTimeMillis());
+            remember(payload);
             webSocket.pushMessageReliable(payload.toJSONString());  // ② 可靠广播
             log.info("📡 推送 localization_status: {}", status);
         } catch (Exception e) {
@@ -207,6 +264,7 @@ public class WebSocketPushService {
             message.put("type",      type);
             message.put("data",      data);
             message.put("timestamp", System.currentTimeMillis());
+            remember(message);
             webSocket.pushMessage(message.toJSONString());          // ① 高频广播
         } catch (Exception e) {
             log.error("高频广播失败: type={}", type, e);
@@ -223,6 +281,7 @@ public class WebSocketPushService {
             message.put("type",      type);
             message.put("data",      data);
             message.put("timestamp", System.currentTimeMillis());
+            remember(message);
             webSocket.pushMessageReliable(message.toJSONString());  // ② 可靠广播
         } catch (Exception e) {
             log.error("可靠广播失败: type={}", type, e);

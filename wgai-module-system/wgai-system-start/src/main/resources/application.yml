@@ -33,7 +33,7 @@ ai:
   #   启动日志认这几行才作数：
   #     [昇腾NPU] 未启用 (ai.ascend.enabled=false)              ← 开关没开
   #     [昇腾NPU] device 0 context ready                        ← 单颗 chip 就绪
-  #     [昇腾NPU] 模型池就绪, devices=[0, 1]                     ← 两颗都就绪
+  #     [昇腾NPU] 模型池就绪, devices=[0, 1]                     ← 两颗都就绪保活上传内容
   #     [昇腾NPU] xxx.om 就绪, 副本数=2 分布在 device0 device1    ← 模型加载成功
   # 走 NPU 的判定：model_type 字典 = 100（图像/姿态识别看 tab_ai_model.model_dify_type，
   #   视频订阅看 tab_ai_subscription_new.model_jm_type）；20=ONNX，其它=OpenCV DNN
@@ -273,6 +273,15 @@ ros:
   map:
     startup-init:
       enabled: false
+  navigation:
+    initial-refine-max-rounds: 12
+    initial-refine-interval-ms: 750
+    initial-refine-stable-m: 0.05
+    initial-refine-stable-deg: 1.0
+    localization-check-timeout-ms: 8000       # 新定位检查最长等待，超时不执行目标/机动
+    localization-stable-updates: 3           # 连续新 AMCL 更新，扣除里程计运动后必须一致
+    localization-max-correction-m: 0.25     # 单次 map 修正上限，超出停止任务
+    localization-max-correction-deg: 3.0    # 单次朝向修正上限，正常车体旋转由里程计扣除
   nav2:
     # global_costmap 车身外扩(m)。Smac 只判车身轮廓线压没压到障碍格，要硬性留余量只能把车身撑大。
     # 窄车位/窄通道进不去时往下调(0.05~0.10)，发目标前的车身预检查也用这个值。
@@ -313,13 +322,15 @@ ros:
     auto-restart: false
     # 自动重启的最小间隔,防止 fast_lio 起不来时无限重启风暴
     restart-cooldown-ms: 300000
+  pointcloud:
+    preview-full-resolution: true # 临时诊断：关闭浏览器点云预览抽样和 Z 裁剪，恢复普通预览设 false
   robot-full:
     launch-file: /home/ros/robot_full.launch.py
     # Java 起的子进程不继承人工终端的 source，这两个 setup.bash 必须显式 source
     ros-setup: /opt/ros/humble/setup.bash
     # 等导航栈就绪的时间。robot_full.launch.py 里 Nav2 是 T+12s 才启动，要留够余量
     ready-wait-ms: 20000
-    # 车体自身遮挡过滤(livox_self_filter.py)。保存地图后 Java 自动重启栈时透传成 SELF_FILTER 环境变量。
+    # 车体自身遮挡过滤(C++ livox_self_filter节点)。保存地图后 Java 自动重启栈时透传成 SELF_FILTER 环境变量。
     # ⚠ 必须和你人工 ros2 launch 时用的值一致，不然重启后过滤会悄悄关掉、下一张图又出车体重影。
     #
     # 默认 true —— 不过滤的话车体自身点会同时污染建图和导航:
@@ -330,4 +341,5 @@ ros:
     # 判据 `ros2 topic delay /livox/lidar_filtered` 单调上涨(2026-08 实测过到 41s)，
     # 此时 fast_lio 会拿过期点云配准并把位姿发散成百万米级，比重影严重得多。
     # 真遇上应该去修过滤实现(改 C++)，而不是长期关着过滤跑。
+    # 默认开启；仅显式配置 false 才关闭自身过滤。
     self-filter: true

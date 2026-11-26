@@ -40,6 +40,8 @@ import org.jeecg.modules.system.controller.wavUtil;
 import org.jeecg.modules.system.entity.SysAnnouncementSend;
 import org.jeecg.modules.tab.AIModel.AIModelYolo3;
 import org.jeecg.modules.tab.AIModel.NetPush;
+import org.jeecg.modules.tab.AIModel.onnx.JavaVideoPushWorker;
+import org.jeecg.modules.tab.AIModel.onnx.VideoReadOnnx;
 import org.jeecg.modules.tab.AIModel.OnnxModelCacheService;
 import org.jeecg.modules.tab.AIModel.OnnxModelWrapper;
 import org.jeecg.modules.tab.AIModel.VideoSendReadCfg;
@@ -815,6 +817,7 @@ public class TabAiHistoryServiceImpl extends ServiceImpl<TabAiHistoryMapper, Tab
             OnnxModelWrapper endNet=getOnnxModel(  tabAiModel1);
             beforePush.setSession(endNet.getSession());
             beforePush.setEnv(endNet.getEnv());
+            beforePush.setTabAiModel(tabAiModel1);
             beforePush.setClaseeNames(Files.readAllLines(Paths.get(tabAiModel1.getAiNameName())));
             beforePush.setIsFollow(0);
             beforePush.setFollowPosition(300);
@@ -833,11 +836,16 @@ public class TabAiHistoryServiceImpl extends ServiceImpl<TabAiHistoryMapper, Tab
             RedisCacheHolder.put(tabAiModelBund.getId()  + "videoRead",true);
             // 备注可配置识别专用流地址（如RTSP），未配置时兼容原视频地址。
             boolean useRemarkUrl = StringUtils.isNotBlank(tabAiModelBund.getRemake());
-            String videoUrl = useRemarkUrl
-                    ? tabAiModelBund.getRemake().trim() : tabAiModelBund.getSendUrl();
+            String videoUrl = "2".equals(tabAiModelBund.getRecognitionMode())
+                    ? tabAiModelBund.getInferenceVideoUrl().trim()
+                    : (useRemarkUrl ? tabAiModelBund.getRemake().trim() : tabAiModelBund.getSendUrl());
             log.info("[识别流地址选择] 绑定ID={}, 来源={}, 协议={}", tabAiModelBund.getId(),
                     useRemarkUrl ? "备注(remake)" : "原地址(sendUrl)",
                     StringUtils.substringBefore(videoUrl, ":"));
+            if ("2".equals(tabAiModelBund.getRecognitionMode())) {
+                VideoReadOnnx detector = new VideoReadOnnx(beforePush, tabAudioDevice, tabAiModelBund, videoUrl, redisTemplate, userId, tabAiModel1.getAiNameName(), webSocket);
+                return JavaVideoPushWorker.start(detector) ? 0 : 1;
+            }
             String savePath="";
             if(tabAiModel1.getModelDify()!=null&&tabAiModel1.getModelDify()==2){  //姿态识别
                 log.info("姿态识别");
@@ -1112,6 +1120,23 @@ public class TabAiHistoryServiceImpl extends ServiceImpl<TabAiHistoryMapper, Tab
 
 
         TabAiModel aiModel=modelMapper.selectById(tabAiModelBund.getModelName());
+        if ("2".equals(tabAiModelBund.getRecognitionMode()) && !"0".equals(tabAiModelBund.getSpaceOne())) {
+            String engine = tabAiModelBund.getExecutionEngine() == null ? "java" : tabAiModelBund.getExecutionEngine();
+            if (!"java".equals(engine)) return Result.error("Python 执行方式暂未接入启动，请先选择 Java");
+            if (aiModel == null || !(Integer.valueOf(20).equals(aiModel.getModelDifyType()) || "20".equals(aiModel.getSpareOne()))) return Result.error("Java 推流要求选择 ONNX 模型");
+            if (aiModel.getModelDify() != null && aiModel.getModelDify() != 1) return Result.error("Java 推流首版支持目标检测模型，暂不支持姿态、分割、OCR等模型");
+            Integer fps = tabAiModelBund.getInferenceFps();
+            if (StringUtils.isBlank(tabAiModelBund.getId()) || StringUtils.isBlank(tabAiModelBund.getInferenceVideoUrl()) || StringUtils.isBlank(tabAiModelBund.getZlmPushUrl()) || fps == null || fps < 1 || fps > 60) return Result.error("请先保存完整的推理地址、ZLM推流地址和识别频率");
+            if (!tabAiModelBund.getZlmPushUrl().matches("(?i)^rtmps?://.+|^rtsp://.+")) return Result.error("ZLM 推流地址须使用 RTMP(S) 或 RTSP");
+            if (JavaVideoPushWorker.isRunning(tabAiModelBund.getId())) return Result.error("该视频任务仍在运行或停止中，请勿重复启动");
+            try {
+                return this.saveIdentifyLocalVideoThreadOnnx(tabAiModelBund, path, userId) == 0
+                    ? Result.OK("Java 推流任务已提交，请通过推流状态查看实际连接结果") : Result.error("Java 推流启动失败，请查看后端日志");
+            } catch (Exception e) {
+                log.error("Java 推流启动失败", e);
+                return Result.error("Java 推流初始化失败：" + e.getMessage());
+            }
+        }
         if(aiModel!=null){
 
 

@@ -810,7 +810,9 @@ public class BatchInferenceScheduler {
     }
 
     private String getModelKey(NetPush netPush) {
-        return netPush.getTabAiModel().getId() + "_" + netPush.getDifyType();
+        // 批次使用首个任务的推理后端；OM 与 ONNX 不能混入同一队列。
+        return netPush.getTabAiModel().getId() + "_" + netPush.getDifyType()
+                + "_" + netPush.getTabAiSubscriptionNew().getModelJmType();
     }
 
     private void logStatistics() {
